@@ -1,0 +1,28 @@
+{% extends "base.html" %}{% block title %}Statystyki · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<h1>Statystyki</h1>
+<p class="muted">Statystyki łączą dane z Audit Logu, historycznych danych zapisanych w bazie i ręcznych korekt. Jeśli historia jest niepełna, liczby historyczne również mogą być niepełne.</p>
+
+<div class="stats-top section">
+  <div class="card donut-card">
+    <div class="donut" style="--added: {{ added_pct }}%;"><div><b>{{ total_joined + total_removed }}</b><span>zdarzeń</span></div></div>
+    <div><h2>Dołączenia vs usunięcia</h2><div class="legend"><span><i class="dot goodbg"></i> Dołączenia: <b>{{ total_joined }}</b></span><span><i class="dot badbg"></i> Usunięcia: <b>{{ total_removed }}</b></span></div><p class="small muted">Liczone tylko tam, gdzie znamy datę dołączenia lub usunięcia.</p></div>
+  </div>
+  <div class="card"><h2>Szybki podgląd</h2><div class="mini-kpis"><div><span class="muted">Zapraszających</span><b>{{ inviters|length }}</b></div><div><span class="muted">Usuwających</span><b>{{ removers|length }}</b></div><div><span class="muted">Ostatnio dodanych</span><b>{{ recent_joined|length }}</b></div><div><span class="muted">Ostatnio usuniętych</span><b>{{ recent_removed|length }}</b></div></div></div>
+</div>
+
+<div class="two section">
+  <div class="card"><h2>Najwięcej zaproszeń</h2><div class="bars">{% for actor,n,pct in inviter_bars %}<div class="barrow"><div class="barlabel"><span>{{ actor }}</span><b>{{ n }}</b></div><div class="bartrack"><i class="barfill goodfill" style="width:{{ pct }}%"></i></div></div>{% else %}<div class="muted">Brak danych.</div>{% endfor %}</div></div>
+  <div class="card"><h2>Najwięcej usunięć</h2><div class="bars">{% for actor,n,pct in remover_bars %}<div class="barrow"><div class="barlabel"><span>{{ actor }}</span><b>{{ n }}</b></div><div class="bartrack"><i class="barfill badfill" style="width:{{ pct }}%"></i></div></div>{% else %}<div class="muted">Brak danych.</div>{% endfor %}</div></div>
+</div>
+
+<div class="two section">
+  <div><h2>Ostatnio dodani</h2><table><thead><tr><th>Użytkownik</th><th>E-mail</th><th>Data dołączenia</th><th>Zaprosił</th></tr></thead><tbody>{% for u in recent_joined %}<tr><td><a href="{{ url_for('user_detail',key=u.user_key) }}"><b>{{ u.login or '—' }}</b></a></td><td>{{ u.email or '—' }}</td><td class="small">{{ u.joined_at }}</td><td>{{ u.invited_by or '—' }}</td></tr>{% else %}<tr><td colspan="4" class="muted">Brak danych.</td></tr>{% endfor %}</tbody></table></div>
+  <div><h2>Ostatnio usunięci</h2><table><thead><tr><th>Użytkownik</th><th>E-mail</th><th>Data usunięcia</th><th>Usunął</th></tr></thead><tbody>{% for u in recent_removed %}<tr><td><a href="{{ url_for('user_detail',key=u.user_key) }}"><b>{{ u.login or '—' }}</b></a></td><td>{{ u.email or '—' }}</td><td class="small">{{ u.removed_at }}</td><td>{{ u.removed_by or '—' }}</td></tr>{% else %}<tr><td colspan="4" class="muted">Brak danych.</td></tr>{% endfor %}</tbody></table></div>
+</div>
+
+<div class="two section">
+  <div><h2>Zaproszenia — pełna tabela</h2><table><thead><tr><th>Zapraszający</th><th>Liczba</th></tr></thead><tbody>{% for a,n in inviters %}<tr><td>{{ a }}</td><td><b>{{ n }}</b></td></tr>{% else %}<tr><td colspan="2" class="muted">Brak danych.</td></tr>{% endfor %}</tbody></table></div>
+  <div><h2>Usunięcia — pełna tabela</h2><table><thead><tr><th>Usuwający</th><th>Liczba</th></tr></thead><tbody>{% for a,n in removers %}<tr><td>{{ a }}</td><td><b>{{ n }}</b></td></tr>{% else %}<tr><td colspan="2" class="muted">Brak danych.</td></tr>{% endfor %}</tbody></table></div>
+</div>
+{% endblock %}

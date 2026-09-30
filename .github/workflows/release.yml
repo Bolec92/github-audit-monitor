@@ -1,0 +1,50 @@
+name: Publish immutable release assets
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="$(cat VERSION)"
+          [[ "$TAG" == "v$VERSION" ]] || { echo "Tag $TAG does not match VERSION=$VERSION"; exit 1; }
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ROOT="github-audit-monitor-$TAG"
+          mkdir -p "dist/$ROOT"
+          cp -a app deploy scripts systemd VERSION README.md LICENSE .env.example docker-compose.yml update-v0.7.sh "dist/$ROOT/"
+          tar -C dist -czf "dist/github-audit-monitor-$TAG.tar.gz" "$ROOT"
+          sed "s/__RELEASE_TAG__/$TAG/g" deploy/proxmox-install.sh > dist/proxmox-install.sh
+          chmod +x dist/proxmox-install.sh
+          (cd dist && sha256sum "github-audit-monitor-$TAG.tar.gz" proxmox-install.sh > SHA256SUMS)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            "dist/github-audit-monitor-$TAG.tar.gz" \
+            dist/proxmox-install.sh \
+            dist/SHA256SUMS \
+            --title "GitHub Audit Monitor $TAG" \
+            --generate-notes

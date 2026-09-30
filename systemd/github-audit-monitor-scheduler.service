@@ -1,0 +1,24 @@
+[Unit]
+Description=GitHub Audit Monitor snapshot scheduler
+After=network-online.target github-audit-monitor-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghamaudit
+Group=ghamaudit
+WorkingDirectory=/opt/github-audit-monitor/app
+EnvironmentFile=/etc/github-audit-monitor/config.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/github-audit-monitor/.venv/bin/python /opt/github-audit-monitor/app/scheduler.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/github-audit-monitor /var/backups/github-audit-monitor
+
+[Install]
+WantedBy=multi-user.target

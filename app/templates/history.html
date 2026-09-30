@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% block title %}Historia zmian · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<div class="row"><div><h1>Ogólna historia zmian</h1><p class="muted">Jedna oś czasu łącząca wykryte różnice między snapshotami z zaimportowanym GitHub Audit Logiem.</p></div></div>
+<div class="row section">
+  <a class="btn {% if source=='all' %}primary{% endif %}" href="{{ url_for('history_page',source='all',q=q) }}">Wszystkie</a>
+  <a class="btn {% if source=='snapshot' %}primary{% endif %}" href="{{ url_for('history_page',source='snapshot',q=q) }}">Snapshoty</a>
+  <a class="btn {% if source=='audit' %}primary{% endif %}" href="{{ url_for('history_page',source='audit',q=q) }}">Audit Log</a>
+  <form method="get" class="row" style="flex:1;min-width:300px">
+    <input type="hidden" name="source" value="{{ source }}"><input class="search" name="q" value="{{ q }}" placeholder="user, actor, team, repo, akcja..."><button class="btn">Szukaj</button>
+  </form>
+</div>
+<table class="section"><thead><tr><th>Czas</th><th>Źródło</th><th>Użytkownik</th><th>Zmiana</th><th>Actor</th></tr></thead><tbody>
+{% for r in rows %}<tr>
+  <td class="small mono">{{ r.timestamp }}</td>
+  <td>{% if r.source=='audit' %}<span class="pill state-outside">Audit Log</span>{% else %}<span class="pill state-current">Snapshot</span>{% endif %}<div class="small muted">{{ r.detail_type }}</div></td>
+  <td>{% if r.user_key %}<a href="{{ url_for('user_detail',key=r.user_key) }}"><b>{{ r.user_login or r.user_key }}</b></a>{% elif r.user_login %}<b>{{ r.user_login }}</b>{% else %}<span class="muted">—</span>{% endif %}</td>
+  <td><b>{{ r.summary }}</b>{% if r.team %}<div class="small muted">Team: {{ r.team }}</div>{% endif %}{% if r.repo %}<div class="small muted">Repo: {{ r.repo }}</div>{% endif %}</td>
+  <td>{{ r.actor or '—' }}</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">Brak pasujących zdarzeń.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

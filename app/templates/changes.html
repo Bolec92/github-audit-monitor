@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block title %}Zmiany snapshotów · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<div class="row"><div><h1>Historia zmian snapshotów</h1><p class="muted">Porównanie kolejnych snapshotów. Zmiany dostępów są sprowadzone do czytelnych przejść źródła dostępu, np. <b>Direct Write → Team platform Read</b>.</p></div><a class="btn right" href="{{ url_for('history_page',source='all') }}">Ogólna historia zmian</a></div>
+<table><thead><tr><th>Czas</th><th>Użytkownik</th><th>Co się zmieniło</th><th>Typ</th><th>Porównanie</th></tr></thead><tbody>
+{% for c in changes %}<tr>
+<td class="small">{{ c.detected_at }}</td>
+<td>{% if c.user_key %}<a href="{{ url_for('user_detail',key=c.user_key) }}"><b>{{ c.user_login or c.user_key }}</b></a>{% else %}<span class="muted">—</span>{% endif %}</td>
+<td><b>{{ c.summary }}</b></td>
+<td><span class="pill">{{ c.change_type }}</span> <span class="small muted">{{ c.entity_type }}</span></td>
+<td>
+  <div class="access-transition"><span class="pill">{{ c.before_label }}</span> <b>→</b> <span class="pill">{{ c.after_label }}</span></div>
+  {% if c.entity_type != 'user_repo_access' %}<details style="margin-top:6px"><summary class="small">Dane techniczne</summary><div class="change-compare"><div><b>Poprzednio</b><pre>{{ c.before | tojson(indent=2) if c.before else '—' }}</pre></div><div><b>Teraz</b><pre>{{ c.after | tojson(indent=2) if c.after else '—' }}</pre></div></div></details>{% endif %}
+</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">Brak zmian.</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

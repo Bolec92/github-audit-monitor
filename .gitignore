@@ -1,0 +1,17 @@
+.env
+config.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+backups/
+imports/
+*.json
+*.jsonl
+*.tar.gz
+*.zip
+__pycache__/
+*.pyc
+.venv/
