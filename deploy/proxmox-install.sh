@@ -84,9 +84,12 @@ pct exec "$CTID" -- true >/dev/null 2>&1 || { echo "LXC did not become ready." >
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
 echo "[5/10] Downloading immutable release $RELEASE_TAG..."
-curl -fL "$BASE/github-audit-monitor-$RELEASE_TAG.tar.gz" -o "$TMP/release.tar.gz"
+ASSET="github-audit-monitor-$RELEASE_TAG.tar.gz"
+
+curl -fL "$BASE/$ASSET" -o "$TMP/$ASSET"
 curl -fL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS"
-( cd "$TMP" && grep "github-audit-monitor-$RELEASE_TAG.tar.gz" SHA256SUMS | sha256sum -c - )
+
+( cd "$TMP" && grep "$ASSET" SHA256SUMS | sha256sum -c - )
 
 echo "[6/10] Preparing application configuration..."
 umask 077
@@ -108,7 +111,7 @@ CONFIG="$TMP/config.env"
   printf 'EMAIL_DOMAIN_REWRITE_TO=%s\n' "$EMAIL_TO"
 } > "$CONFIG"
 
-pct push "$CTID" "$TMP/release.tar.gz" /tmp/gham-release.tar.gz --perms 0600
+pct push "$CTID" "$TMP/$ASSET" /tmp/gham-release.tar.gz --perms 0600
 pct push "$CTID" "$CONFIG" /tmp/gham-config.env --perms 0600
 if [[ -n "$RESTORE_PATH" ]]; then
   echo "[7/10] Copying archive to LXC..."
