@@ -123,10 +123,10 @@ else
 fi
 
 echo "[8/10] Installing application inside LXC..."
-pct exec "$CTID" -- bash -lc 'rm -rf /tmp/gham && mkdir /tmp/gham && tar -xzf /tmp/gham-release.tar.gz -C /tmp/gham --strip-components=1 && bash /tmp/gham/deploy/lxc-install.sh /tmp/gham'
+pct exec "$CTID" -- env LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= bash -lc 'rm -rf /tmp/gham && mkdir /tmp/gham && tar -xzf /tmp/gham-release.tar.gz -C /tmp/gham --strip-components=1 && bash /tmp/gham/deploy/lxc-install.sh /tmp/gham'
 
 echo "[9/10] Checking service health..."
-pct exec "$CTID" -- bash -lc 'set -a; . /etc/github-audit-monitor/config.env; set +a; curl -fsS "http://127.0.0.1:${PORT:-8080}/health"' >/dev/null
+pct exec "$CTID" -- env LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= bash -lc 'set -a; . /etc/github-audit-monitor/config.env; set +a; curl -fsS "http://127.0.0.1:${PORT:-8080}/health"' >/dev/null
 IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
 echo "[10/10] Complete."
 cat <<OUT
