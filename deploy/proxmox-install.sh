@@ -111,6 +111,8 @@ CONFIG="$TMP/config.env"
   printf 'EMAIL_DOMAIN_REWRITE_TO=%s\n' "$EMAIL_TO"
 } > "$CONFIG"
 
+umask 022
+
 pct push "$CTID" "$TMP/$ASSET" /tmp/gham-release.tar.gz --perms 0600
 pct push "$CTID" "$CONFIG" /tmp/gham-config.env --perms 0600
 if [[ -n "$RESTORE_PATH" ]]; then
