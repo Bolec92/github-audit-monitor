@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+umask 022
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+unset LANGUAGE || true
+
 SOURCE_DIR="${1:-/tmp/gham}"
 [[ -d "$SOURCE_DIR/app" ]] || { echo "Release payload not found in $SOURCE_DIR" >&2; exit 1; }
 [[ -f /tmp/gham-config.env ]] || { echo "Missing /tmp/gham-config.env" >&2; exit 1; }
