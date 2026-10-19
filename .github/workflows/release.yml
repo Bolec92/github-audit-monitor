@@ -29,7 +29,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           ROOT="github-audit-monitor-$TAG"
           mkdir -p "dist/$ROOT"
-          cp -a app deploy scripts systemd VERSION README.md LICENSE .env.example docker-compose.yml update-v0.7.sh "dist/$ROOT/"
+          cp -a app deploy scripts systemd VERSION README.md SECURITY.md LICENSE .env.example docker-compose.yml update-v0.8.sh "dist/$ROOT/"
           tar -C dist -czf "dist/github-audit-monitor-$TAG.tar.gz" "$ROOT"
           sed "s/^RELEASE_TAG=\"__RELEASE_TAG__\"$/RELEASE_TAG=\"$TAG\"/" deploy/proxmox-install.sh > dist/proxmox-install.sh
           chmod +x dist/proxmox-install.sh

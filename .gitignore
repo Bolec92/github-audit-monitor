@@ -15,3 +15,5 @@ imports/
 __pycache__/
 *.pyc
 .venv/
+
+*.key

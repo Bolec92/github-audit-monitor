@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Pierwsza konfiguracja · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="card">
+    <h1>Pierwsza konfiguracja</h1>
+    <p class="muted">Utwórz lokalne konto administratora. Kod konfiguracji jest generowany jednorazowo podczas instalacji LXC i nie jest przechowywany w postaci jawnej.</p>
+    <div class="notice warnbox section"><b>Potrzebujesz Setup Code.</b><br><span class="small">Znajdziesz go w końcowym komunikacie instalatora na hoście Proxmox. Kod wygasa automatycznie i po utworzeniu konta nie może zostać użyty ponownie.</span></div>
+    {% if error %}<div class="notice badbox section">{{ error }}</div>{% endif %}
+    <form method="post" class="section" autocomplete="off">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="field"><label>Setup Code</label><input type="password" name="setup_code" autocomplete="off" required autofocus></div>
+      <div class="field section"><label>Login administratora</label><input name="username" autocomplete="username" minlength="3" maxlength="64" required></div>
+      <div class="field section"><label>Hasło administratora</label><input type="password" name="password" autocomplete="new-password" minlength="14" required><div class="small muted" style="margin-top:5px">Minimum 14 znaków. Hasło jest zapisywane wyłącznie jako hash Argon2id.</div></div>
+      <div class="field section"><label>Powtórz hasło</label><input type="password" name="password_confirm" autocomplete="new-password" minlength="14" required></div>
+      <div class="section"><button class="btn primary" type="submit">Utwórz konto administratora</button></div>
+    </form>
+  </div>
+</div>
+{% endblock %}

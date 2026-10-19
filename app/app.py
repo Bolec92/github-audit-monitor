@@ -3,18 +3,25 @@ import io
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, url_for
 
 from audit import (
     actor_for_direct_repo, actor_for_team_membership, actor_for_team_repo,
     audit_index, identity_from_audit, norm,
 )
-from collector import ORG, collect_snapshot, compare_snapshots
+from collector import collect_snapshot, compare_snapshots, test_connection
+from security import (
+    authenticate_admin, change_admin_password, clear_auth_failures, create_admin_from_setup,
+    create_session, github_connection, has_admin, init_security_db, load_session,
+    migrate_legacy_env_connection, record_auth_failure, remove_github_connection, revoke_session,
+    save_github_connection, setup_code_valid, throttle_status, verify_admin_password,
+)
 from db import (
     backup_database, create_snapshot, delete_user_override, fail_snapshot, finish_snapshot,
     get_overrides, import_audit_events, init_db, latest_snapshot_any,
@@ -34,9 +41,144 @@ SNAPSHOT_MINUTE = int(os.getenv("SNAPSHOT_MINUTE", "0"))
 RUN_ON_START = os.getenv("RUN_ON_START", "true").lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0").strip() or "0.0.0.0"
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "gham_session")
+CSRF_COOKIE_NAME = os.getenv("CSRF_COOKIE_NAME", "gham_csrf")
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"}
+SESSION_COOKIE_MAX_AGE = max(300, int(os.getenv("SESSION_MAX_HOURS", "12")) * 3600)
+COOKIE_SAMESITE = "Strict"
 EMAIL_DOMAIN_REWRITE_FROM = os.getenv("EMAIL_DOMAIN_REWRITE_FROM", "").strip().lower()
 EMAIL_DOMAIN_REWRITE_TO = os.getenv("EMAIL_DOMAIN_REWRITE_TO", "").strip().lower()
 AUDIT_FILTER = "action:org.invite_member action:org.add_member action:org.remove_member action:org.add_outside_collaborator action:org.remove_outside_collaborator action:org.update_default_repository_permission action:team.add_member action:team.remove_member action:team.add_repository action:team.remove_repository action:team.update_repository_permission action:repo.add_member action:repo.update_member action:repo.remove_member"
+
+
+def current_org():
+    try:
+        cfg = github_connection(include_token=False)
+        return cfg.get("org") or os.getenv("GITHUB_ORG", "").strip() or "Nie skonfigurowano"
+    except Exception:
+        return os.getenv("GITHUB_ORG", "").strip() or "Nie skonfigurowano"
+
+
+def client_ip():
+    # Do not trust X-Forwarded-For until TRUST_PROXY is explicitly implemented.
+    return request.remote_addr or "unknown"
+
+
+def csrf_token():
+    token = request.cookies.get(CSRF_COOKIE_NAME)
+    if not token:
+        token = getattr(g, "new_csrf_token", None) or secrets.token_urlsafe(32)
+        g.new_csrf_token = token
+    return token
+
+
+def _csrf_valid():
+    cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    supplied = request.form.get("_csrf") or request.headers.get("X-CSRF-Token")
+    return bool(cookie and supplied and secrets.compare_digest(str(cookie), str(supplied)))
+
+
+def _safe_next(value):
+    value = str(value or "").strip()
+    if value.startswith("/") and not value.startswith("//"):
+        return value
+    return url_for("index")
+
+
+def reauthenticate_current_admin(password):
+    """Rate-limited password confirmation for sensitive authenticated operations."""
+    admin = getattr(g, "current_admin", None) or {}
+    subject = str(admin.get("id") or admin.get("username") or "admin")
+    blocked, wait_seconds = throttle_status("reauth", subject, client_ip())
+    if blocked:
+        return False, f"Zbyt wiele nieudanych prób. Spróbuj ponownie za około {max(1, wait_seconds // 60 + 1)} min."
+    if not verify_admin_password(admin.get("id"), password):
+        record_auth_failure("reauth", subject, client_ip())
+        return False, "Bieżące hasło administratora jest nieprawidłowe."
+    clear_auth_failures("reauth", subject, client_ip())
+    return True, None
+
+
+@app.before_request
+def enforce_authentication():
+    g.current_admin = None
+    csrf_token()
+    endpoint = request.endpoint or ""
+    admin_exists = has_admin()
+
+    if endpoint == "health" or endpoint == "static":
+        return None
+
+    if not admin_exists:
+        if endpoint != "setup":
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "setup_required"}), 503
+            return redirect(url_for("setup"))
+        if request.method == "POST" and not _csrf_valid():
+            return "Nieprawidłowy token CSRF", 400
+        return None
+
+    if endpoint == "setup":
+        return redirect(url_for("index"))
+
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        try:
+            g.current_admin = load_session(token, user_agent=request.headers.get("User-Agent"))
+        except Exception:
+            LOG.exception("Session validation failed")
+            g.current_admin = None
+
+    if endpoint == "login":
+        if g.current_admin:
+            return redirect(url_for("index"))
+        if request.method == "POST" and not _csrf_valid():
+            return "Nieprawidłowy token CSRF", 400
+        return None
+
+    if not g.current_admin:
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "authentication_required"}), 401
+        return redirect(url_for("login", next=request.full_path if request.query_string else request.path))
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _csrf_valid():
+        return "Nieprawidłowy token CSRF", 400
+    return None
+
+
+@app.after_request
+def security_headers(response):
+    if not request.cookies.get(CSRF_COOKIE_NAME):
+        response.set_cookie(
+            CSRF_COOKIE_NAME, csrf_token(), max_age=12 * 3600, httponly=True,
+            secure=SESSION_COOKIE_SECURE, samesite=COOKIE_SAMESITE, path="/"
+        )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    return response
+
+
+@app.context_processor
+def inject_security_context():
+    try:
+        cfg = github_connection(include_token=False)
+        github_configured = bool(cfg.get("configured"))
+    except Exception:
+        github_configured = False
+    return {
+        "csrf_token": csrf_token(),
+        "current_admin": getattr(g, "current_admin", None),
+        "session_cookie_secure": SESSION_COOKIE_SECURE,
+        "github_configured": github_configured,
+    }
 
 
 def progress(msg): run_state["progress"] = msg
@@ -47,9 +189,14 @@ def execute_snapshot():
     run_state.update({"running": True, "progress": "Starting...", "last_error": None})
     snapshot_id = None
     try:
-        snapshot_id = create_snapshot(ORG)
+        connection = github_connection(include_token=True)
+        if not connection.get("configured"):
+            raise RuntimeError("Połączenie GitHub nie jest skonfigurowane. Ustaw organizację i token w Ustawieniach.")
+        org = connection["org"]
+        token = connection["token"]
+        snapshot_id = create_snapshot(org)
         previous = latest_successful_snapshot(exclude_id=snapshot_id)
-        current, login = collect_snapshot(progress=progress)
+        current, login = collect_snapshot(progress=progress, org=org, token=token)
         changes = compare_snapshots(previous.get("data") if previous else None, current)
         finish_snapshot(snapshot_id, current, changes, authenticated_user=login)
         backup = backup_database()
@@ -74,7 +221,15 @@ def scheduler_loop():
         now = datetime.now(tz); next_run = now.replace(hour=SNAPSHOT_HOUR, minute=SNAPSHOT_MINUTE, second=0, microsecond=0)
         if next_run <= now: next_run += timedelta(days=1)
         LOG.info("Next scheduled snapshot: %s", next_run.isoformat())
-        time.sleep(max(1, (next_run - now).total_seconds())); execute_snapshot(); time.sleep(2)
+        time.sleep(max(1, (next_run - now).total_seconds()))
+        try:
+            if github_connection(include_token=False).get("configured"):
+                execute_snapshot()
+            else:
+                LOG.info("Scheduled snapshot skipped: GitHub connection is not configured")
+        except Exception:
+            LOG.exception("Scheduled snapshot preflight failed")
+        time.sleep(2)
 
 
 def latest_data():
@@ -519,8 +674,128 @@ def parse_json_object(file):
     except json.JSONDecodeError as exc: raise ValueError("Nie udało się odczytać JSON backupu Mappera") from exc
 
 
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        confirm = request.form.get("password_confirm") or ""
+        code = request.form.get("setup_code") or ""
+        blocked, wait_seconds = throttle_status("setup", "setup", client_ip())
+        if blocked:
+            error = f"Zbyt wiele nieudanych prób. Spróbuj ponownie za około {max(1, wait_seconds // 60 + 1)} min."
+        elif password != confirm:
+            record_auth_failure("setup", "setup", client_ip())
+            error = "Hasła nie są identyczne."
+        elif not setup_code_valid(code):
+            record_auth_failure("setup", "setup", client_ip())
+            error = "Nieprawidłowy lub wygasły kod konfiguracji."
+        else:
+            try:
+                create_admin_from_setup(code, username, password)
+                clear_auth_failures("setup", "setup", client_ip())
+                admin, auth_error = authenticate_admin(username, password, client_ip())
+                if not admin:
+                    raise RuntimeError(auth_error or "Nie udało się utworzyć sesji administratora.")
+                token, _ = create_session(admin["id"], client_ip(), request.headers.get("User-Agent"))
+                resp = redirect(url_for("github_settings"))
+                resp.set_cookie(SESSION_COOKIE_NAME, token, max_age=SESSION_COOKIE_MAX_AGE, httponly=True, secure=SESSION_COOKIE_SECURE, samesite=COOKIE_SAMESITE, path="/")
+                return resp
+            except Exception as exc:
+                LOG.exception("Initial setup failed")
+                error = str(exc)
+    return render_template("setup.html", org="GitHub Audit Monitor", error=error)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        admin, error = authenticate_admin(username, password, client_ip())
+        if admin:
+            token, _ = create_session(admin["id"], client_ip(), request.headers.get("User-Agent"))
+            resp = redirect(_safe_next(request.form.get("next") or request.args.get("next")))
+            resp.set_cookie(SESSION_COOKIE_NAME, token, max_age=SESSION_COOKIE_MAX_AGE, httponly=True, secure=SESSION_COOKIE_SECURE, samesite=COOKIE_SAMESITE, path="/")
+            return resp
+    return render_template("login.html", org="GitHub Audit Monitor", error=error, next_target=_safe_next(request.args.get("next")))
+
+
+@app.post("/logout")
+def logout():
+    revoke_session(request.cookies.get(SESSION_COOKIE_NAME))
+    resp = redirect(url_for("login"))
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
+@app.route("/settings/github", methods=["GET", "POST"])
+def github_settings():
+    message = None
+    error = None
+    cfg = github_connection(include_token=False)
+    if request.method == "POST":
+        action = (request.form.get("action") or "save").strip().lower()
+        current_password = request.form.get("current_password") or ""
+        reauth_ok, reauth_error = reauthenticate_current_admin(current_password)
+        if not reauth_ok:
+            error = reauth_error
+        elif action == "remove":
+            remove_github_connection(updated_by=g.current_admin["username"])
+            message = "Połączenie GitHub zostało usunięte."
+        else:
+            org = (request.form.get("github_org") or "").strip()
+            submitted_token = (request.form.get("github_token") or "").strip()
+            try:
+                existing = github_connection(include_token=True)
+                token = submitted_token or existing.get("token") or ""
+                if not token:
+                    raise ValueError("Wprowadź token GitHub.")
+                result = test_connection(org, token)
+                if action == "test":
+                    message = f"Połączenie działa. GitHub: {result.get('login') or 'unknown'} · organizacja: {result.get('organization') or org}."
+                else:
+                    save_github_connection(org, token, login=result.get("login"), updated_by=g.current_admin["username"])
+                    message = f"Połączenie GitHub zapisane i zweryfikowane jako {result.get('login') or 'unknown'}."
+            except Exception as exc:
+                LOG.warning("GitHub connection update failed: %s", exc)
+                error = str(exc)
+        cfg = github_connection(include_token=False)
+    return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error)
+
+
+@app.post("/settings/account/password")
+def account_password_change():
+    error = None
+    message = None
+    current_password = request.form.get("current_password") or ""
+    new_password = request.form.get("new_password") or ""
+    confirm = request.form.get("new_password_confirm") or ""
+    if new_password != confirm:
+        error = "Nowe hasła nie są identyczne."
+    else:
+        reauth_ok, reauth_error = reauthenticate_current_admin(current_password)
+        if not reauth_ok:
+            error = reauth_error
+            cfg = github_connection(include_token=False)
+            return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error), 429 if "Zbyt wiele" in error else 400
+        try:
+            change_admin_password(g.current_admin["id"], current_password, new_password)
+            message = "Hasło zostało zmienione. Zaloguj się ponownie."
+            resp = redirect(url_for("login", changed="1"))
+            resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+            return resp
+        except Exception as exc:
+            error = str(exc)
+    cfg = github_connection(include_token=False)
+    return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error), 400
+
+
 @app.route("/health")
-def health(): return jsonify({"ok":True,"running":run_state["running"]})
+def health():
+    return jsonify({"ok": True})
 
 @app.route("/")
 def index():
@@ -531,7 +806,7 @@ def index():
     repo_collabs=[u for u in all_users if u.get("is_repo_collaborator") and not u.get("hidden")]
     historical=[u for u in all_users if not u.get("current") and not u.get("hidden")]
     hidden=[u for u in all_users if u.get("hidden")]
-    return render_template("index.html",org=ORG,latest=latest,snapshot=snapshot,users=active[:20],total_users=len(active),outside_count=len(outside),repo_collab_count=len(repo_collabs),historical_count=len(historical),hidden_count=len(hidden),changes=decorate_changes(list_changes(12), all_users),run_state=run_state,tz=TZ_NAME,schedule=f"{SNAPSHOT_HOUR:02d}:{SNAPSHOT_MINUTE:02d}")
+    return render_template("index.html",org=current_org(),latest=latest,snapshot=snapshot,users=active[:20],total_users=len(active),outside_count=len(outside),repo_collab_count=len(repo_collabs),historical_count=len(historical),hidden_count=len(hidden),changes=decorate_changes(list_changes(12), all_users),run_state=run_state,tz=TZ_NAME,schedule=f"{SNAPSHOT_HOUR:02d}:{SNAPSHOT_MINUTE:02d}")
 
 @app.route("/users")
 def users_page():
@@ -548,13 +823,13 @@ def users_page():
     counts["all"]=counts["active"]+counts["outside"]+counts["repo_collaborators"]+counts["historical"]
     q=request.args.get("q","").strip()
     users, scope = apply_user_scope(all_users, scope, q)
-    return render_template("users.html",org=ORG,users=users,q=q,scope=scope,counts=counts,run_state=run_state)
+    return render_template("users.html",org=current_org(),users=users,q=q,scope=scope,counts=counts,run_state=run_state)
 
 @app.route("/users/<path:key>")
 def user_detail(key):
     user=find_user(key)
     if user is None: return "User not found",404
-    return render_template("user.html",org=ORG,user=user,run_state=run_state)
+    return render_template("user.html",org=current_org(),user=user,run_state=run_state)
 
 @app.route("/users/<path:key>/edit",methods=["GET","POST"])
 def user_edit(key):
@@ -566,7 +841,7 @@ def user_edit(key):
             invited_by=request.form.get("invited_by") or None, display_name=request.form.get("display_name") or None, notes=request.form.get("notes") or None,
             hidden=request.form.get("hidden")=="1")
         backup_database(); return redirect(url_for("user_detail",key=key))
-    return render_template("user_edit.html",org=ORG,user=user)
+    return render_template("user_edit.html",org=current_org(),user=user)
 
 @app.post("/users/<path:key>/reset-override")
 def user_reset_override(key):
@@ -598,7 +873,7 @@ def user_add():
             joined_at=request.form.get("joined_at") or None, invited_at=request.form.get("invited_at") or None, invited_by=request.form.get("invited_by") or None,
             display_name=request.form.get("display_name") or None, notes=request.form.get("notes") or None, hidden=False)
         backup_database(); return redirect(url_for("user_detail",key=key))
-    return render_template("user_edit.html",org=ORG,user=None)
+    return render_template("user_edit.html",org=current_org(),user=None)
 
 @app.route("/audit",methods=["GET","POST"])
 def audit_import_page():
@@ -609,7 +884,7 @@ def audit_import_page():
             if not f or not f.filename: raise ValueError("Wybierz plik JSON")
             events=parse_json_upload(f); result=import_audit_events(events,f.filename); backup_database()
         except Exception as exc: error=str(exc)
-    return render_template("audit.html",org=ORG,result=result,error=error,imports=list_audit_imports(20),audit_filter=AUDIT_FILTER)
+    return render_template("audit.html",org=current_org(),result=result,error=error,imports=list_audit_imports(20),audit_filter=AUDIT_FILTER)
 
 @app.route("/statistics")
 def statistics_page():
@@ -628,12 +903,12 @@ def statistics_page():
     recent_removed=sorted([u for u in users if u.get("removed_at")],key=lambda u:str(u.get("removed_at")),reverse=True)[:10]
     total_joined=sum(1 for u in users if u.get("joined_at")); total_removed=sum(1 for u in users if u.get("removed_at"))
     denom=max(1,total_joined+total_removed); added_pct=round(total_joined/denom*100,1)
-    return render_template("statistics.html",org=ORG,inviters=inviters,removers=removers,inviter_bars=inviter_bars,remover_bars=remover_bars,recent_joined=recent_joined,recent_removed=recent_removed,total_joined=total_joined,total_removed=total_removed,added_pct=added_pct)
+    return render_template("statistics.html",org=current_org(),inviters=inviters,removers=removers,inviter_bars=inviter_bars,remover_bars=remover_bars,recent_joined=recent_joined,recent_removed=recent_removed,total_joined=total_joined,total_removed=total_removed,added_pct=added_pct)
 
 @app.route("/changes")
 def changes_page():
     users=build_users(latest_data(), include_hidden=True)
-    return render_template("changes.html",org=ORG,changes=decorate_changes(list_changes(500),users),run_state=run_state)
+    return render_template("changes.html",org=current_org(),changes=decorate_changes(list_changes(500),users),run_state=run_state)
 
 @app.route("/history")
 def history_page():
@@ -643,12 +918,16 @@ def history_page():
     try: limit=min(max(int(request.args.get("limit","500")),50),1000)
     except Exception: limit=500
     rows=build_combined_history(source=source,q=q,limit=limit)
-    return render_template("history.html",org=ORG,rows=rows,source=source,q=q,limit=limit,run_state=run_state)
+    return render_template("history.html",org=current_org(),rows=rows,source=source,q=q,limit=limit,run_state=run_state)
 
 @app.route("/snapshots")
-def snapshots_page(): return render_template("snapshots.html",org=ORG,snapshots=list_snapshots(100),run_state=run_state)
+def snapshots_page(): return render_template("snapshots.html",org=current_org(),snapshots=list_snapshots(100),run_state=run_state)
 @app.post("/run-snapshot")
-def run_snapshot_now(): start_snapshot_background(); return redirect(url_for("index"))
+def run_snapshot_now():
+    if not github_connection(include_token=False).get("configured"):
+        return redirect(url_for("github_settings"))
+    start_snapshot_background()
+    return redirect(url_for("index"))
 
 @app.route("/users/export.csv")
 def users_export_csv():
@@ -666,7 +945,7 @@ def api_users():
     scope=request.args.get("scope","active"); q=request.args.get("q","")
     users,scope=apply_user_scope(build_users(latest_data(),include_hidden=True),scope,q)
     latest=latest_successful_snapshot()
-    return jsonify({"organization":ORG,"scope":scope,"count":len(users),"snapshot_id":latest.get("id") if latest else None,"snapshot_finished_at":latest.get("finished_at") if latest else None,"users":[user_api_row(u) for u in users]})
+    return jsonify({"organization":current_org(),"scope":scope,"count":len(users),"snapshot_id":latest.get("id") if latest else None,"snapshot_finished_at":latest.get("finished_at") if latest else None,"users":[user_api_row(u) for u in users]})
 
 @app.route("/api/users/<path:key>")
 def api_user_detail(key):
@@ -678,8 +957,21 @@ def api_user_detail(key):
 def api_status(): return jsonify({"run":run_state,"latest":latest_snapshot_any()})
 
 init_db()
+init_security_db()
+try:
+    if migrate_legacy_env_connection():
+        LOG.info("Migrated legacy GitHub token from environment into encrypted security storage")
+except Exception:
+    LOG.warning("Legacy GitHub connection was not migrated during app startup", exc_info=True)
 
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop,daemon=True,name="scheduler").start()
-    if RUN_ON_START: threading.Thread(target=execute_snapshot,daemon=True,name="initial-snapshot").start()
+    if RUN_ON_START:
+        try:
+            if github_connection(include_token=False).get("configured"):
+                threading.Thread(target=execute_snapshot,daemon=True,name="initial-snapshot").start()
+            else:
+                LOG.info("Initial snapshot skipped: GitHub connection is not configured")
+        except Exception:
+            LOG.exception("Initial snapshot preflight failed")
     app.run(host=BIND_ADDRESS,port=PORT,debug=False,threaded=True)

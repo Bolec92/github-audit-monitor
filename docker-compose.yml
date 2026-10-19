@@ -9,6 +9,9 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
+      SECURITY_DB_PATH: "${SECURITY_DB_PATH:-/data/security.db}"
+      MASTER_KEY_PATH: "${MASTER_KEY_PATH:-/data/security.key}"
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-false}"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Logowanie · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="card">
+    <h1>Logowanie</h1>
+    <p class="muted">Panel GitHub Audit Monitor jest dostępny wyłącznie po uwierzytelnieniu.</p>
+    {% if request.args.get('changed') %}<div class="notice goodbox section">Hasło zostało zmienione. Zaloguj się ponownie.</div>{% endif %}
+    {% if error %}<div class="notice badbox section">{{ error }}</div>{% endif %}
+    <form method="post" class="section" autocomplete="on">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next_target }}">
+      <div class="field"><label>Login administratora</label><input name="username" autocomplete="username" maxlength="64" required autofocus></div>
+      <div class="field section"><label>Hasło</label><input type="password" name="password" autocomplete="current-password" required></div>
+      <div class="section"><button class="btn primary" type="submit">Zaloguj</button></div>
+    </form>
+  </div>
+</div>
+{% endblock %}

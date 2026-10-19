@@ -8,8 +8,8 @@ import requests
 LOG = logging.getLogger("collector")
 
 API = "https://api.github.com"
-ORG = os.getenv("GITHUB_ORG", "my-organization")
-TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+DEFAULT_ORG = os.getenv("GITHUB_ORG", "").strip()
+DEFAULT_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 API_VERSION = os.getenv("GITHUB_API_VERSION", "2026-03-10")
 TIMEOUT = 30
 
@@ -18,16 +18,17 @@ class GitHubAPIError(RuntimeError):
     pass
 
 
-def _session():
-    if not TOKEN:
-        raise GitHubAPIError("GITHUB_TOKEN is empty")
+def _session(token=None):
+    token = str(token if token is not None else DEFAULT_TOKEN).strip()
+    if not token:
+        raise GitHubAPIError("GitHub token is not configured")
     s = requests.Session()
     s.headers.update(
         {
-            "Authorization": f"Bearer {TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": API_VERSION,
-            "User-Agent": "github-audit-monitor/0.7.0",
+            "User-Agent": "github-audit-monitor/0.8.0",
         }
     )
     return s
@@ -89,13 +90,30 @@ def slim_user(u):
     return {"id": u.get("id"), "login": u.get("login"), "type": u.get("type")}
 
 
-def collect_snapshot(progress=None):
+def test_connection(org, token):
+    org = str(org or "").strip()
+    token = str(token or "").strip()
+    if not org:
+        raise GitHubAPIError("GitHub organization is not configured")
+    session = _session(token)
+    me = get_json(session, "/user")
+    org_obj = get_json(session, f"/orgs/{quote(org)}")
+    # Verify that the token can at least read the organization member endpoint.
+    github_get(session, f"/orgs/{quote(org)}/members", params={"per_page": 1})
+    return {"login": me.get("login"), "organization": org_obj.get("login") or org, "org_id": org_obj.get("id")}
+
+
+def collect_snapshot(progress=None, org=None, token=None):
     def say(msg):
         LOG.info(msg)
         if progress:
             progress(msg)
 
-    session = _session()
+    org = str(org if org is not None else DEFAULT_ORG).strip()
+    token = str(token if token is not None else DEFAULT_TOKEN).strip()
+    if not org:
+        raise GitHubAPIError("GitHub organization is not configured")
+    session = _session(token)
     warnings = []
     generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -104,16 +122,16 @@ def collect_snapshot(progress=None):
     login = me.get("login")
     say(f"      Authenticated as: {login}")
 
-    say(f"[1/6] Reading organization and members: {ORG}")
-    org_obj = get_json(session, f"/orgs/{quote(ORG)}")
-    members_raw = get_paged(session, f"/orgs/{quote(ORG)}/members", {"filter": "all", "role": "all"})
+    say(f"[1/6] Reading organization and members: {org}")
+    org_obj = get_json(session, f"/orgs/{quote(org)}")
+    members_raw = get_paged(session, f"/orgs/{quote(org)}/members", {"filter": "all", "role": "all"})
     members = [slim_user(u) for u in members_raw]
     say(f"      Members: {len(members)}")
 
     say("[2/6] Reading outside collaborators...")
     outside_complete = True
     try:
-        outside_raw = get_paged(session, f"/orgs/{quote(ORG)}/outside_collaborators", {"filter": "all"})
+        outside_raw = get_paged(session, f"/orgs/{quote(org)}/outside_collaborators", {"filter": "all"})
         outside_collaborators = [slim_user(u) for u in outside_raw]
         say(f"      Outside collaborators: {len(outside_collaborators)}")
     except Exception as exc:
@@ -126,13 +144,13 @@ def collect_snapshot(progress=None):
     member_ids = {str(u.get("id")) for u in members if u.get("id") is not None}
 
     say("[3/6] Reading teams and team members...")
-    teams_raw = get_paged(session, f"/orgs/{quote(ORG)}/teams", {"team_type": "all"})
+    teams_raw = get_paged(session, f"/orgs/{quote(org)}/teams", {"team_type": "all"})
     teams = []
     for i, t in enumerate(teams_raw, 1):
         slug = t.get("slug") or t.get("name")
         say(f"      Team {i}/{len(teams_raw)}: {slug}")
         try:
-            tm = get_paged(session, f"/orgs/{quote(ORG)}/teams/{quote(slug)}/members", {"role": "all"})
+            tm = get_paged(session, f"/orgs/{quote(org)}/teams/{quote(slug)}/members", {"role": "all"})
         except Exception as exc:
             warnings.append(f"team members {slug}: {exc}")
             tm = []
@@ -148,20 +166,20 @@ def collect_snapshot(progress=None):
         )
 
     say("[4/6] Reading repositories...")
-    repos_raw = get_paged(session, f"/orgs/{quote(ORG)}/repos", {"type": "all", "sort": "full_name", "direction": "asc"})
+    repos_raw = get_paged(session, f"/orgs/{quote(org)}/repos", {"type": "all", "sort": "full_name", "direction": "asc"})
     say(f"      Repositories: {len(repos_raw)}")
 
     say("[5/6] Reading repository teams and direct collaborators...")
     repositories = []
     for i, repo in enumerate(repos_raw, 1):
         name = repo.get("name")
-        full = repo.get("full_name") or f"{ORG}/{name}"
+        full = repo.get("full_name") or f"{org}/{name}"
         if i == 1 or i % 10 == 0 or i == len(repos_raw):
             say(f"      Repo {i}/{len(repos_raw)}: {full}")
 
         repo_teams = []
         try:
-            rt = get_paged(session, f"/repos/{quote(ORG)}/{quote(name)}/teams")
+            rt = get_paged(session, f"/repos/{quote(org)}/{quote(name)}/teams")
             for t in rt:
                 repo_teams.append(
                     {
@@ -178,7 +196,7 @@ def collect_snapshot(progress=None):
         try:
             dc = get_paged(
                 session,
-                f"/repos/{quote(ORG)}/{quote(name)}/collaborators",
+                f"/repos/{quote(org)}/{quote(name)}/collaborators",
                 {"affiliation": "direct"},
             )
             for u in dc:
@@ -213,7 +231,7 @@ def collect_snapshot(progress=None):
     snapshot = {
         "schemaVersion": 1,
         "generatedAt": generated_at,
-        "organization": ORG,
+        "organization": org,
         "authenticatedUser": login,
         "organizationDefaultPermission": org_obj.get("default_repository_permission"),
         "members": members,

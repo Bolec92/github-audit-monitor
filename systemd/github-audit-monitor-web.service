@@ -14,10 +14,20 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/bin/sh -c 'exec /opt/github-audit-monitor/.venv/bin/gunicorn --workers 1 --threads 4 --timeout 120 --bind "${BIND_ADDRESS:-0.0.0.0}:${PORT:-8080}" app:app'
 Restart=on-failure
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
 ReadWritePaths=/var/lib/github-audit-monitor /var/backups/github-audit-monitor
 
 [Install]
