@@ -39,7 +39,7 @@ LOG = logging.getLogger("app")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 run_lock = threading.Lock()
-run_state = {"running": False, "progress": "Idle", "last_error": None}
+run_state = {"running": False, "progress": "Idle", "last_error": None, "snapshot_id": None}
 DEFAULT_TZ_NAME = os.getenv("TZ", "Europe/Warsaw")
 DEFAULT_SNAPSHOT_HOUR = int(os.getenv("SNAPSHOT_HOUR", "3"))
 DEFAULT_SNAPSHOT_MINUTE = int(os.getenv("SNAPSHOT_MINUTE", "0"))
@@ -257,7 +257,7 @@ def security_headers(response):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     )
     return response
 
@@ -280,6 +280,88 @@ def inject_security_context():
 def progress(msg): run_state["progress"] = msg
 
 
+def dashboard_run_status():
+    """Return a lightweight status that also sees scheduler snapshots from another process."""
+    latest = latest_snapshot_any()
+    local_running = bool(run_state.get("running"))
+    db_running = bool(latest and latest.get("status") == "running")
+
+    if local_running:
+        return {
+            "running": True,
+            "progress": run_state.get("progress") or "Snapshot w toku...",
+            "last_error": run_state.get("last_error"),
+        }
+
+    if db_running:
+        return {"running": True, "progress": "Snapshot w toku...", "last_error": None}
+
+    if latest and run_state.get("snapshot_id") == latest.get("id"):
+        return {
+            "running": False,
+            "progress": run_state.get("progress") or "Idle",
+            "last_error": run_state.get("last_error"),
+        }
+
+    if latest and latest.get("status") == "failed":
+        error = latest.get("error") or "nieznany błąd"
+        return {"running": False, "progress": f"FAILED: {error}", "last_error": error}
+
+    if latest and latest.get("status") == "success":
+        finished = latest.get("finished_at") or "nieznany czas"
+        return {"running": False, "progress": f"Completed: {finished} UTC", "last_error": None}
+
+    return {"running": False, "progress": "Idle", "last_error": None}
+
+
+def audit_import_freshness():
+    """Classify the age of the most recent manual Audit Log import."""
+    imports = list_audit_imports(1)
+    if not imports:
+        return {
+            "available": False,
+            "level": "bad",
+            "status_label": "brak importu",
+            "age_label": "Audit Log nie był jeszcze importowany",
+            "imported_at": None,
+            "filename": None,
+        }
+
+    row = imports[0]
+    imported_at = row.get("imported_at")
+    try:
+        imported = datetime.fromisoformat(str(imported_at).replace("Z", "+00:00"))
+        if imported.tzinfo is None:
+            imported = imported.replace(tzinfo=ZoneInfo("UTC"))
+        age_seconds = max(0.0, (datetime.now(ZoneInfo("UTC")) - imported.astimezone(ZoneInfo("UTC"))).total_seconds())
+        display_days = int(age_seconds // 86400)
+
+        if age_seconds <= 7 * 86400:
+            level, status_label = "good", "świeży"
+        elif age_seconds <= 14 * 86400:
+            level, status_label = "warn", "do odświeżenia"
+        else:
+            level, status_label = "bad", "nieaktualny"
+
+        if display_days == 0:
+            age_label = "dzisiaj"
+        elif display_days == 1:
+            age_label = "1 dzień temu"
+        else:
+            age_label = f"{display_days} dni temu"
+    except (TypeError, ValueError):
+        level, status_label, age_label = "bad", "nieznany wiek", "nie udało się odczytać daty importu"
+
+    return {
+        "available": True,
+        "level": level,
+        "status_label": status_label,
+        "age_label": age_label,
+        "imported_at": imported_at,
+        "filename": row.get("filename"),
+    }
+
+
 def execute_snapshot():
     if not run_lock.acquire(blocking=False):
         return False
@@ -294,6 +376,7 @@ def execute_snapshot():
                 org = connection["org"]
                 token = connection["token"]
                 snapshot_id = create_snapshot(org)
+                run_state["snapshot_id"] = snapshot_id
                 previous = latest_successful_snapshot(exclude_id=snapshot_id)
                 current, login = collect_snapshot(progress=progress, org=org, token=token)
                 changes = compare_snapshots(previous.get("data") if previous else None, current)
@@ -1000,7 +1083,13 @@ def index():
     hidden=[u for u in all_users if u.get("hidden")]
     sched=snapshot_config()
     schedule=(f"{sched['time']} ({sched['timezone']})" if sched["enabled"] else "wyłączone")
-    return render_template("index.html",org=current_org(),latest=latest,snapshot=snapshot,users=active[:20],total_users=len(active),outside_count=len(outside),repo_collab_count=len(repo_collabs),historical_count=len(historical),hidden_count=len(hidden),changes=decorate_changes(list_changes(12), all_users),run_state=run_state,tz=sched["timezone"],schedule=schedule)
+    return render_template(
+        "index.html", org=current_org(), latest=latest, snapshot=snapshot, users=active[:20],
+        total_users=len(active), outside_count=len(outside), repo_collab_count=len(repo_collabs),
+        historical_count=len(historical), hidden_count=len(hidden),
+        changes=decorate_changes(list_changes(12), all_users), run_state=dashboard_run_status(),
+        audit_freshness=audit_import_freshness(), tz=sched["timezone"], schedule=schedule,
+    )
 
 @app.route("/users")
 def users_page():
@@ -1120,7 +1209,8 @@ def snapshots_page(): return render_template("snapshots.html",org=current_org(),
 def run_snapshot_now():
     if not github_connection(include_token=False).get("configured"):
         return redirect(url_for("github_settings"))
-    start_snapshot_background()
+    if not dashboard_run_status().get("running"):
+        start_snapshot_background()
     return redirect(url_for("index"))
 
 @app.route("/users/export.csv")
@@ -1146,6 +1236,21 @@ def api_user_detail(key):
     user=find_user(key)
     if user is None: return jsonify({"error":"user_not_found"}),404
     return jsonify(user_api_row(user,detailed=True))
+
+@app.route("/api/dashboard-status")
+def api_dashboard_status():
+    latest = latest_snapshot_any()
+    latest_summary = None
+    if latest:
+        latest_summary = {
+            "id": latest.get("id"),
+            "status": latest.get("status"),
+            "started_at": latest.get("started_at"),
+            "finished_at": latest.get("finished_at"),
+            "error": latest.get("error"),
+        }
+    return jsonify({"run": dashboard_run_status(), "latest": latest_summary})
+
 
 @app.route("/api/status")
 def api_status(): return jsonify({"run":run_state,"latest":latest_snapshot_any()})
