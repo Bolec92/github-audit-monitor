@@ -44,6 +44,8 @@ State-changing requests require a CSRF token. Cookies use `HttpOnly` and `SameSi
 - active sessions,
 - GitHub PAT.
 
+A browser-based business-data import replaces only `github-audit.db`; it validates SQLite integrity and creates a safety backup first. `security.db`, the administrator account, sessions, master key and GitHub PAT are deliberately outside that restore path.
+
 After a portable restore on a new LXC, create a new local administrator and configure the GitHub connection again.
 
 A full Proxmox/PBS backup of the entire LXC will naturally include local security state and must be protected accordingly.

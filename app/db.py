@@ -1,13 +1,23 @@
 import hashlib
+import io
 import json
 import os
 import sqlite3
+import tarfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux in production; keeps local tooling portable.
+    fcntl = None
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/github-audit.db")
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
+_OPERATION_THREAD_LOCK = threading.RLock()
 
 
 def utc_now():
@@ -21,6 +31,97 @@ def connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+
+
+@contextmanager
+def database_operation_lock():
+    """Serialize snapshot/restore operations across web and scheduler processes."""
+    lock_path = Path(DB_PATH).with_name(".github-audit-monitor.operation.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _OPERATION_THREAD_LOCK:
+        with open(lock_path, "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def inspect_database(path):
+    """Validate a candidate business-data SQLite database and return a compact summary."""
+    path = str(path)
+    if not os.path.isfile(path):
+        raise ValueError("Plik bazy danych nie istnieje.")
+    with open(path, "rb") as fh:
+        if fh.read(16) != b"SQLite format 3\x00":
+            raise ValueError("Plik nie jest prawidłową bazą SQLite.")
+    uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30)
+    try:
+        check = conn.execute("PRAGMA quick_check").fetchone()
+        if not check or str(check[0]).lower() != "ok":
+            raise ValueError(f"SQLite quick_check nie przeszedł: {check[0] if check else 'unknown'}")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "snapshots" not in tables:
+            raise ValueError("To nie wygląda na bazę GitHub Audit Monitor: brak tabeli snapshots.")
+        counts = {}
+        for table in ("snapshots", "changes", "audit_events", "audit_imports", "user_overrides", "mapper_users"):
+            if table in tables:
+                counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            else:
+                counts[table] = 0
+        return {"tables": sorted(tables), "counts": counts}
+    finally:
+        conn.close()
+
+
+def restore_database_from_path(source_path):
+    """Replace business data from a validated SQLite file while preserving security.db."""
+    info = inspect_database(source_path)
+    with database_operation_lock():
+        safety_backup = backup_database() if Path(DB_PATH).exists() else None
+        src_uri = f"file:{Path(source_path).resolve().as_posix()}?mode=ro"
+        src = sqlite3.connect(src_uri, uri=True, timeout=30)
+        dst = connect()
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        init_db()
+        # Verify the resulting live DB before reporting success.
+        live_info = inspect_database(DB_PATH)
+    return {"safety_backup": safety_backup, "imported": info, "live": live_info}
+
+
+def create_portable_backup():
+    """Create a secret-free tar.gz backup suitable for browser download/import."""
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    raw_path = Path(backup_database())
+    dest = Path(BACKUP_DIR) / f"github-audit-backup-{stamp}.tar.gz"
+    manifest = {
+        "application": "GitHub Audit Monitor",
+        "created_at": utc_now(),
+        "contains_secrets": False,
+        "format": 1,
+    }
+    payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+    with tarfile.open(dest, "w:gz") as tf:
+        ti = tarfile.TarInfo("manifest.json")
+        ti.size = len(payload)
+        ti.mode = 0o640
+        tf.addfile(ti, io.BytesIO(payload))
+        tf.add(raw_path, arcname="data/github-audit.db", recursive=False)
+    try:
+        os.chmod(dest, 0o640)
+    except OSError:
+        pass
+    return str(dest)
 
 
 def init_db():

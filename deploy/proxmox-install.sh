@@ -39,19 +39,9 @@ if [[ "$MODE" == "advanced" ]]; then
   fi
 fi
 
-TZ="$(input "Timezone" "$HOST_TZ")"
-EMAIL_FROM=""; EMAIL_TO=""
-if whiptail --title "$APP_NAME" --yesno "Configure an exact e-mail domain rewrite?\n\nExample: old-company.com -> new-company.com" 12 72; then
-  EMAIL_FROM="$(input "Rewrite FROM domain (without @)" "")"
-  EMAIL_TO="$(input "Rewrite TO domain (without @)" "")"
-fi
-RESTORE_PATH=""
-if whiptail --title "$APP_NAME" --yesno "Restore an existing GitHub Audit Monitor portable data backup after installation?\n\nThe backup contains audit/snapshot data only; credentials and GitHub tokens are never restored." 13 76; then
-  RESTORE_PATH="$(input "Path to backup .tar.gz on this Proxmox host" "/root/github-audit-backup.tar.gz")"
-  [[ -f "$RESTORE_PATH" ]] || { msg "Backup file not found:\n$RESTORE_PATH"; exit 1; }
-fi
+TZ="$HOST_TZ"
 
-SUMMARY="CT ID: $CTID\nHostname: $HOSTNAME\nCPU: $CORES\nRAM: ${MEMORY} MB\nSwap: ${SWAP} MB\nDisk: ${DISK} GB\nStorage: $ROOTFS_STORAGE\nBridge: $BRIDGE\nNetwork: $NETMODE\nVersion: $RELEASE_TAG\n\nGitHub organization/token will be configured securely in the panel after first login."
+SUMMARY="CT ID: $CTID\nHostname: $HOSTNAME\nCPU: $CORES\nRAM: ${MEMORY} MB\nSwap: ${SWAP} MB\nDisk: ${DISK} GB\nStorage: $ROOTFS_STORAGE\nBridge: $BRIDGE\nNetwork: $NETMODE\nVersion: $RELEASE_TAG\n\nApplication configuration, GitHub connection, data import, e-mail normalization and snapshot schedule are configured in the panel after first login."
 whiptail --title "$APP_NAME" --yesno "Create the LXC with these settings?\n\n$SUMMARY" 24 80 || exit 0
 
 pct status "$CTID" >/dev/null 2>&1 && { echo "CT $CTID already exists." >&2; exit 1; }
@@ -78,14 +68,19 @@ for _ in $(seq 1 30); do pct exec "$CTID" -- true >/dev/null 2>&1 && break; slee
 pct exec "$CTID" -- true >/dev/null 2>&1 || { echo "LXC did not become ready." >&2; exit 1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
-echo "[5/10] Downloading immutable release $RELEASE_TAG..."
 ASSET="github-audit-monitor-$RELEASE_TAG.tar.gz"
-
-curl -fL "$BASE/$ASSET" -o "$TMP/$ASSET"
-curl -fL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS"
-
-( cd "$TMP" && grep "$ASSET" SHA256SUMS | sha256sum -c - )
+if [[ -n "${GHAM_LOCAL_ASSET_DIR:-}" ]]; then
+  echo "[5/10] Using local release assets from $GHAM_LOCAL_ASSET_DIR..."
+  [[ -f "$GHAM_LOCAL_ASSET_DIR/$ASSET" && -f "$GHAM_LOCAL_ASSET_DIR/SHA256SUMS" ]] || { echo "Missing $ASSET or SHA256SUMS in $GHAM_LOCAL_ASSET_DIR" >&2; exit 1; }
+  cp "$GHAM_LOCAL_ASSET_DIR/$ASSET" "$TMP/$ASSET"
+  cp "$GHAM_LOCAL_ASSET_DIR/SHA256SUMS" "$TMP/SHA256SUMS"
+else
+  BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
+  echo "[5/10] Downloading immutable release $RELEASE_TAG..."
+  curl -fL "$BASE/$ASSET" -o "$TMP/$ASSET"
+  curl -fL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS"
+fi
+( cd "$TMP" && grep -F "  $ASSET" SHA256SUMS | sha256sum -c - )
 
 echo "[6/10] Preparing application configuration..."
 umask 077
@@ -95,6 +90,7 @@ CONFIG="$TMP/config.env"
   printf 'GITHUB_TOKEN=\n'
   printf 'GITHUB_API_VERSION=%s\n' '2026-03-10'
   printf 'TZ=%s\n' "$TZ"
+  printf 'SNAPSHOT_ENABLED=%s\n' 'true'
   printf 'SNAPSHOT_HOUR=%s\n' '3'
   printf 'SNAPSHOT_MINUTE=%s\n' '0'
   printf 'RUN_ON_START=%s\n' 'false'
@@ -113,20 +109,13 @@ CONFIG="$TMP/config.env"
   printf 'LOGIN_BLOCK_MINUTES=%s\n' '15'
   printf 'SETUP_CODE_TTL_HOURS=%s\n' '24'
   printf 'PASSWORD_MIN_LENGTH=%s\n' '14'
-  printf 'EMAIL_DOMAIN_REWRITE_FROM=%s\n' "$EMAIL_FROM"
-  printf 'EMAIL_DOMAIN_REWRITE_TO=%s\n' "$EMAIL_TO"
+  printf 'EMAIL_DOMAIN_REWRITE_FROM=\n'
+  printf 'EMAIL_DOMAIN_REWRITE_TO=\n'
 } > "$CONFIG"
-
-umask 022
 
 pct push "$CTID" "$TMP/$ASSET" /tmp/gham-release.tar.gz --perms 0600
 pct push "$CTID" "$CONFIG" /tmp/gham-config.env --perms 0600
-if [[ -n "$RESTORE_PATH" ]]; then
-  echo "[7/10] Copying portable archive to LXC..."
-  pct push "$CTID" "$RESTORE_PATH" /tmp/gham-restore.tar.gz --perms 0600
-else
-  echo "[7/10] Fresh application database selected."
-fi
+echo "[7/10] Fresh application database selected. Existing data can be imported later from Settings."
 
 echo "[8/10] Installing application inside LXC..."
 pct exec "$CTID" -- env LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= bash -lc 'rm -rf /tmp/gham && mkdir /tmp/gham && tar -xzf /tmp/gham-release.tar.gz -C /tmp/gham --strip-components=1 && bash /tmp/gham/deploy/lxc-install.sh /tmp/gham'
@@ -152,9 +141,9 @@ Setup:      http://${IP:-LXC_IP}:8080/setup
 ONE-TIME SETUP CODE:
 ${SETUP_CODE:-NOT_AVAILABLE_RUN_gham-security_setup-code}
 
-Create the local administrator account first. Then open Settings -> GitHub connection
-and configure the organization and GitHub PAT. No GitHub token is stored in config.env
-on a fresh installation.
+Create the local administrator account first. Then finish application configuration in
+Settings: GitHub connection, optional old database import, e-mail normalization and
+snapshot schedule. No GitHub token is stored in config.env on a fresh installation.
 
 Status:     pct exec $CTID -- gham-status
 Backup:     pct exec $CTID -- gham-backup

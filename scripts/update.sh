@@ -10,6 +10,15 @@ with urllib.request.urlopen(f'https://api.github.com/repos/{repo}/releases/lates
 PY
 )"
 [[ "v$CURRENT" == "$LATEST" ]] && { echo "Already on $LATEST"; exit 0; }
+CURRENT_BASE="${CURRENT%%-*}"
+LATEST_VERSION="${LATEST#v}"
+if [[ "$CURRENT_BASE" != "$LATEST_VERSION" ]]; then
+  NEWEST="$(printf '%s\n%s\n' "$CURRENT_BASE" "$LATEST_VERSION" | sort -V | tail -1)"
+  if [[ "$NEWEST" == "$CURRENT_BASE" ]]; then
+    echo "Current v$CURRENT is newer than latest stable $LATEST; refusing to downgrade."
+    exit 0
+  fi
+fi
 echo "Updating v$CURRENT -> $LATEST"
 
 if [[ -f /var/lib/github-audit-monitor/github-audit.db ]]; then
@@ -48,6 +57,7 @@ find /opt/github-audit-monitor/app -type f -exec chmod 0644 {} +
 
 # Add v0.8 security settings without overwriting local values.
 add_env(){ local k="$1" v="$2"; grep -q "^${k}=" "$CONFIG" || printf '%s=%s\n' "$k" "$v" >> "$CONFIG"; }
+add_env SNAPSHOT_ENABLED true
 add_env SECURITY_DB_PATH /var/lib/github-audit-monitor/security.db
 add_env MASTER_KEY_PATH /etc/github-audit-monitor/master.key
 add_env SESSION_COOKIE_SECURE false

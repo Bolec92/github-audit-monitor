@@ -17,6 +17,7 @@ cp -a "$HERE/app" "$TARGET/app"
 cp "$HERE/docker-compose.yml" "$TARGET/docker-compose.yml"
 
 add_env(){ local k="$1" v="$2"; grep -q "^${k}=" "$TARGET/.env" || printf '%s=%s\n' "$k" "$v" >> "$TARGET/.env"; }
+add_env SNAPSHOT_ENABLED true
 add_env SECURITY_DB_PATH /data/security.db
 add_env MASTER_KEY_PATH /data/security.key
 add_env SESSION_COOKIE_SECURE false

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Ustawienia · GitHub Audit Monitor{% endblock %}
 {% block content %}
-<div class="row"><div><h1 style="margin-bottom:4px">Ustawienia</h1><div class="muted">Połączenie GitHub i bezpieczeństwo lokalnego konta administratora.</div></div></div>
+<div class="row"><div><h1 style="margin-bottom:4px">Ustawienia</h1><div class="muted">Połączenie GitHub, harmonogram, migracja danych i bezpieczeństwo lokalnego konta.</div></div></div>
 {% if message %}<div class="notice goodbox section">{{ message }}</div>{% endif %}
 {% if error %}<div class="notice badbox section">{{ error }}</div>{% endif %}
 {% if not session_cookie_secure %}<div class="notice warnbox section"><b>Tryb HTTP / LAN.</b> Logowanie chroni dane aplikacji, ale transmisja w sieci lokalnej nie jest szyfrowana TLS. Nie wystawiaj portu aplikacji do Internetu. Po późniejszym wdrożeniu HTTPS ustaw <code>SESSION_COOKIE_SECURE=true</code>.</div>{% endif %}
@@ -11,34 +11,102 @@
     <h2 style="margin-top:0">Połączenie GitHub</h2>
     {% if cfg.configured %}
       <div class="notice goodbox"><b>Połączono</b>{% if cfg.login %} jako <code>{{ cfg.login }}</code>{% endif %}</div>
-      <div class="section small"><b>Organizacja:</b> <code>{{ cfg.org }}</code><br><b>Token:</b> <span class="masked">••••••••••••{{ cfg.token_fingerprint or '' }}</span><br>{% if cfg.last_test_at %}<b>Ostatnia weryfikacja:</b> {{ cfg.last_test_at }} UTC{% endif %}</div>
+      <div class="section small">
+        <b>Organizacja:</b> <code>{{ cfg.org }}</code><br>
+        <b>Token:</b> <span class="masked">••••••••••••{{ cfg.token_fingerprint or '' }}</span><br>
+        {% if cfg.last_test_at %}<b>Ostatnia weryfikacja:</b> {{ cfg.last_test_at }} UTC{% endif %}
+      </div>
+      <form method="post" action="{{ url_for('github_settings') }}" class="section">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="test_saved">
+        <button class="btn" type="submit">Testuj zapisane połączenie</button>
+      </form>
+      <hr class="section">
+      <h3>Zmień organizację lub token</h3>
+      <form method="post" action="{{ url_for('github_settings') }}" autocomplete="off">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <div class="field"><label>Organizacja GitHub</label><input name="github_org" value="{{ cfg.org or '' }}" required></div>
+        <div class="field section"><label>Nowy GitHub PAT</label><input type="password" name="github_token" autocomplete="off" placeholder="Pozostaw puste, aby zachować obecny token"><div class="small muted" style="margin-top:5px">Przed zapisem połączenie jest zawsze ponownie testowane.</div></div>
+        <div class="field section"><label>Bieżące hasło administratora</label><input type="password" name="current_password" autocomplete="current-password" required></div>
+        <div class="row section">
+          <button class="btn primary" name="action" value="save" type="submit">Sprawdź i zapisz</button>
+          <button class="btn badbtn" name="action" value="remove" type="submit">Usuń połączenie</button>
+        </div>
+      </form>
     {% else %}
       <div class="notice warnbox">GitHub nie jest jeszcze skonfigurowany. Snapshoty nie będą uruchamiane do czasu zapisania poprawnego tokenu.</div>
+      <form method="post" action="{{ url_for('github_settings') }}" class="section" autocomplete="off">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <div class="field"><label>Organizacja GitHub</label><input name="github_org" value="{{ cfg.org or '' }}" placeholder="my-organization" required></div>
+        <div class="field section"><label>GitHub Personal Access Token</label><input type="password" name="github_token" autocomplete="off" placeholder="Wprowadź token GitHub" required><div class="small muted" style="margin-top:5px">Token zostanie zapisany dopiero po udanym teście i zaszyfrowany lokalnie AES-256-GCM.</div></div>
+        <div class="field section"><label>Bieżące hasło administratora</label><input type="password" name="current_password" autocomplete="current-password" required></div>
+        <div class="section"><button class="btn primary" name="action" value="save" type="submit">Testuj i zapisz</button></div>
+      </form>
     {% endif %}
-    <form method="post" action="{{ url_for('github_settings') }}" class="section" autocomplete="off">
+  </section>
+
+  <section class="card">
+    <h2 style="margin-top:0">Snapshoty</h2>
+    <p class="muted">Harmonogram można zmieniać z panelu. Scheduler odczytuje ustawienia na bieżąco, bez restartu kontenera/usługi.</p>
+    <form method="post" action="{{ url_for('snapshot_settings_update') }}" autocomplete="off">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-      <div class="field"><label>Organizacja GitHub</label><input name="github_org" value="{{ cfg.org or '' }}" placeholder="my-organization" required></div>
-      <div class="field section"><label>GitHub Personal Access Token</label><input type="password" name="github_token" autocomplete="off" placeholder="{% if cfg.configured %}Pozostaw puste, aby zachować obecny token{% else %}Wprowadź token GitHub{% endif %}"><div class="small muted" style="margin-top:5px">Token jest szyfrowany lokalnie AES-256-GCM. Po zapisaniu nie jest ponownie wyświetlany.</div></div>
+      <label class="row" style="justify-content:flex-start"><input type="checkbox" name="snapshot_enabled" value="1" {% if snapshot_cfg.enabled %}checked{% endif %}> Włącz automatyczne snapshoty</label>
+      <div class="field section"><label>Godzina</label><input type="time" name="snapshot_time" value="{{ snapshot_cfg.time }}" required></div>
+      <div class="field section"><label>Strefa czasowa</label><input name="snapshot_timezone" value="{{ snapshot_cfg.timezone }}" placeholder="Europe/Warsaw" required></div>
+      <div class="section"><button class="btn primary" type="submit">Zapisz harmonogram</button></div>
+    </form>
+    {% if recent_snapshots %}
+      <div class="section small muted">Ostatni snapshot: #{{ recent_snapshots[0].id }} · {{ recent_snapshots[0].status }} · {{ recent_snapshots[0].finished_at or recent_snapshots[0].started_at }}</div>
+    {% endif %}
+  </section>
+</div>
+
+<div class="two section">
+  <section class="card">
+    <h2 style="margin-top:0">Dane i migracja</h2>
+    <p class="muted">Przenośny backup zawiera snapshoty, Audit Log i ręczne korekty. Nie zawiera konta administratora, sesji, master key ani GitHub PAT.</p>
+    <form method="post" action="{{ url_for('data_export') }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Pobierz przenośny backup</button>
+    </form>
+    <hr class="section">
+    <h3>Załaduj starą bazę</h3>
+    <p class="small muted">Akceptowane: surowy <code>github-audit.db</code> albo backup <code>.tar.gz</code> zawierający tę bazę. Import zastępuje tylko bazę danych aplikacji; ustawienia bezpieczeństwa pozostają bez zmian.</p>
+    <form method="post" action="{{ url_for('data_import') }}" enctype="multipart/form-data" autocomplete="off">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="field section"><label>Plik</label><input type="file" name="database_file" accept=".db,.tar,.gz,.tgz,application/x-sqlite3,application/gzip" required></div>
       <div class="field section"><label>Bieżące hasło administratora</label><input type="password" name="current_password" autocomplete="current-password" required></div>
-      <div class="row section">
-        <button class="btn" name="action" value="test" type="submit">Testuj połączenie</button>
-        <button class="btn primary" name="action" value="save" type="submit">Zapisz / zamień token</button>
-        {% if cfg.configured %}<button class="btn badbtn" name="action" value="remove" type="submit">Usuń połączenie</button>{% endif %}
-      </div>
+      <label class="row section" style="justify-content:flex-start"><input type="checkbox" name="confirm_replace" value="1" required> Rozumiem, że aktualne dane biznesowe zostaną zastąpione</label>
+      <div class="notice warnbox section small">Przed podmianą aplikacja automatycznie tworzy kopię aktualnej bazy i sprawdza integralność importowanego SQLite.</div>
+      <button class="btn primary" type="submit">Sprawdź i zaimportuj</button>
     </form>
   </section>
 
   <section class="card">
-    <h2 style="margin-top:0">Konto administratora</h2>
-    <p class="muted">Zmiana hasła unieważnia wszystkie aktywne sesje administratora.</p>
-    <form method="post" action="{{ url_for('account_password_change') }}" class="section" autocomplete="off">
+    <h2 style="margin-top:0">Normalizacja e-mail</h2>
+    <p class="muted">Zmiana dotyczy prezentacji i eksportu. Oryginalny adres zapisany w źródłowych danych nie jest przepisywany.</p>
+    <form method="post" action="{{ url_for('email_settings_update') }}" autocomplete="off">
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-      <div class="field"><label>Bieżące hasło</label><input type="password" name="current_password" autocomplete="current-password" required></div>
-      <div class="field section"><label>Nowe hasło</label><input type="password" name="new_password" autocomplete="new-password" minlength="14" required></div>
-      <div class="field section"><label>Powtórz nowe hasło</label><input type="password" name="new_password_confirm" autocomplete="new-password" minlength="14" required></div>
-      <div class="section"><button class="btn primary" type="submit">Zmień hasło</button></div>
+      <div class="field"><label>Zamień domenę</label><input name="email_from" value="{{ email_cfg['from'] }}" placeholder="old-company.com"></div>
+      <div class="field section"><label>Na domenę</label><input name="email_to" value="{{ email_cfg['to'] }}" placeholder="new-company.com"></div>
+      {% if email_cfg['from'] and email_cfg['to'] %}<div class="notice section"><code>user@{{ email_cfg['from'] }}</code> → <code>user@{{ email_cfg['to'] }}</code></div>{% endif %}
+      <div class="section"><button class="btn primary" type="submit">Zapisz normalizację</button></div>
+      <div class="small muted">Aby wyłączyć regułę, wyczyść oba pola i zapisz.</div>
     </form>
-    <div class="notice section"><b>Zabezpieczenia sesji</b><br><span class="small muted">HttpOnly · SameSite=Strict · serwerowe tokeny sesji · limit czasu bezczynności · blokada brute-force · CSRF na operacjach modyfikujących.</span></div>
   </section>
 </div>
+
+<section class="card section">
+  <h2 style="margin-top:0">Konto administratora</h2>
+  <p class="muted">Zmiana hasła unieważnia wszystkie aktywne sesje administratora.</p>
+  <form method="post" action="{{ url_for('account_password_change') }}" class="two" autocomplete="off">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <div class="field"><label>Bieżące hasło</label><input type="password" name="current_password" autocomplete="current-password" required></div>
+    <div></div>
+    <div class="field"><label>Nowe hasło</label><input type="password" name="new_password" autocomplete="new-password" minlength="14" required></div>
+    <div class="field"><label>Powtórz nowe hasło</label><input type="password" name="new_password_confirm" autocomplete="new-password" minlength="14" required></div>
+    <div><button class="btn primary" type="submit">Zmień hasło</button></div>
+  </form>
+  <div class="notice section"><b>Zabezpieczenia sesji</b><br><span class="small muted">HttpOnly · SameSite=Strict · serwerowe tokeny sesji · limit czasu bezczynności · blokada brute-force · CSRF na operacjach modyfikujących.</span></div>
+</section>
 {% endblock %}

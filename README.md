@@ -66,13 +66,14 @@ bash -c "$(curl -fsSL https://github.com/Bolec92/github-audit-monitor/releases/l
 
 Run the command **on the Proxmox VE host as root**.
 
-The wizard supports:
+The wizard is intentionally infrastructure-only. It supports:
 
-- Default or Advanced LXC settings,
+- Default or Advanced LXC resources,
 - unprivileged Debian LXC,
-- DHCP or static IPv4 configuration,
-- optional exact e-mail domain rewrite,
-- fresh database or restore from an existing portable `github-audit-backup-*.tar.gz` archive.
+- storage and bridge selection,
+- DHCP or static IPv4 configuration.
+
+Application settings are completed after first login in the panel: GitHub connection, optional old database import, e-mail normalization and snapshot schedule.
 
 A new install does **not** ask for a GitHub PAT. After the LXC is ready the installer prints a one-time Setup Code:
 
@@ -87,13 +88,7 @@ Open:
 http://LXC_IP:8080/setup
 ```
 
-Create the local administrator account, then go to:
-
-```text
-Settings -> GitHub connection
-```
-
-and configure the organization and PAT. The token is tested before it can be saved.
+Create the local administrator account, then open **Settings**. Configure the GitHub organization/PAT, optionally import an old database, set e-mail normalization and choose the snapshot schedule. A new PAT is tested before it can be saved.
 
 If the Setup Code is lost before the first administrator account is created:
 
@@ -124,10 +119,11 @@ Native LXC config:
 /etc/github-audit-monitor/config.env
 ```
 
-Important non-secret variables:
+Important non-secret defaults/runtime variables:
 
 ```ini
 TZ=Europe/Warsaw
+SNAPSHOT_ENABLED=true
 SNAPSHOT_HOUR=3
 SNAPSHOT_MINUTE=0
 RUN_ON_START=false
@@ -146,14 +142,7 @@ EMAIL_DOMAIN_REWRITE_FROM=
 EMAIL_DOMAIN_REWRITE_TO=
 ```
 
-E-mail rewriting is optional and exact-domain only. Example:
-
-```ini
-EMAIL_DOMAIN_REWRITE_FROM=old-company.com
-EMAIL_DOMAIN_REWRITE_TO=new-company.com
-```
-
-`user@old-company.com` is displayed/exported as `user@new-company.com`; other domains remain untouched.
+E-mail normalization is configured from **Settings -> E-mail normalization**. It is exact-domain only and affects presentation/export only; source records are not destructively rewritten. The environment variables remain only as defaults/legacy fallback.
 
 ## Audit Log import
 
@@ -189,13 +178,13 @@ The portable archive contains the business SQLite database and manifest. It deli
 - `security.db`,
 - `master.key`.
 
-Restore:
+Restore from the authenticated panel under **Settings -> Data and migration** by uploading either a portable `.tar.gz` backup or a raw `github-audit.db`. The panel validates SQLite integrity and creates an automatic safety backup before replacement. `security.db`, administrator credentials and GitHub PAT remain untouched.
+
+CLI restore is also available:
 
 ```bash
 gham-restore /path/github-audit-backup-20261019-150000.tar.gz
 ```
-
-The Proxmox installer can restore the archive during LXC creation. On a new LXC you still create a fresh local administrator account and configure a new/current PAT.
 
 ## Status, update and security helper
 

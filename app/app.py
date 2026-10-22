@@ -4,12 +4,16 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import tarfile
+import tempfile
 import threading
 import time
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Flask, Response, g, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_file, url_for
 
 from audit import (
     actor_for_direct_repo, actor_for_team_membership, actor_for_team_repo,
@@ -18,26 +22,28 @@ from audit import (
 from collector import collect_snapshot, compare_snapshots, test_connection
 from security import (
     authenticate_admin, change_admin_password, clear_auth_failures, create_admin_from_setup,
-    create_session, github_connection, has_admin, init_security_db, load_session,
+    create_session, get_setting, github_connection, has_admin, init_security_db, load_session,
     migrate_legacy_env_connection, record_auth_failure, remove_github_connection, revoke_session,
-    save_github_connection, setup_code_valid, throttle_status, verify_admin_password,
+    save_github_connection, set_setting, setup_code_valid, throttle_status, verify_admin_password,
 )
 from db import (
-    backup_database, create_snapshot, delete_user_override, fail_snapshot, finish_snapshot,
-    get_overrides, import_audit_events, init_db, latest_snapshot_any,
-    latest_successful_snapshot, list_audit_events, list_audit_imports,
-    list_mapper_users, list_changes, list_snapshots, save_user_override, set_user_hidden,
+    backup_database, create_portable_backup, create_snapshot, database_operation_lock,
+    delete_user_override, fail_snapshot, finish_snapshot, get_overrides, import_audit_events,
+    init_db, latest_snapshot_any, latest_successful_snapshot, list_audit_events,
+    list_audit_imports, list_mapper_users, list_changes, list_snapshots,
+    restore_database_from_path, save_user_override, set_user_hidden,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOG = logging.getLogger("app")
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 run_lock = threading.Lock()
 run_state = {"running": False, "progress": "Idle", "last_error": None}
-TZ_NAME = os.getenv("TZ", "Europe/Warsaw")
-SNAPSHOT_HOUR = int(os.getenv("SNAPSHOT_HOUR", "3"))
-SNAPSHOT_MINUTE = int(os.getenv("SNAPSHOT_MINUTE", "0"))
+DEFAULT_TZ_NAME = os.getenv("TZ", "Europe/Warsaw")
+DEFAULT_SNAPSHOT_HOUR = int(os.getenv("SNAPSHOT_HOUR", "3"))
+DEFAULT_SNAPSHOT_MINUTE = int(os.getenv("SNAPSHOT_MINUTE", "0"))
+DEFAULT_SNAPSHOT_ENABLED = os.getenv("SNAPSHOT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 RUN_ON_START = os.getenv("RUN_ON_START", "true").lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("PORT", "8080"))
 BIND_ADDRESS = os.getenv("BIND_ADDRESS", "0.0.0.0").strip() or "0.0.0.0"
@@ -46,9 +52,99 @@ CSRF_COOKIE_NAME = os.getenv("CSRF_COOKIE_NAME", "gham_csrf")
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"}
 SESSION_COOKIE_MAX_AGE = max(300, int(os.getenv("SESSION_MAX_HOURS", "12")) * 3600)
 COOKIE_SAMESITE = "Strict"
-EMAIL_DOMAIN_REWRITE_FROM = os.getenv("EMAIL_DOMAIN_REWRITE_FROM", "").strip().lower()
-EMAIL_DOMAIN_REWRITE_TO = os.getenv("EMAIL_DOMAIN_REWRITE_TO", "").strip().lower()
+DEFAULT_EMAIL_DOMAIN_REWRITE_FROM = os.getenv("EMAIL_DOMAIN_REWRITE_FROM", "").strip().lower()
+DEFAULT_EMAIL_DOMAIN_REWRITE_TO = os.getenv("EMAIL_DOMAIN_REWRITE_TO", "").strip().lower()
 AUDIT_FILTER = "action:org.invite_member action:org.add_member action:org.remove_member action:org.add_outside_collaborator action:org.remove_outside_collaborator action:org.update_default_repository_permission action:team.add_member action:team.remove_member action:team.add_repository action:team.remove_repository action:team.update_repository_permission action:repo.add_member action:repo.update_member action:repo.remove_member"
+
+
+def _setting_bool(key, default=False):
+    value = get_setting(key, None)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def snapshot_config():
+    tz_name = (get_setting("snapshot_timezone", DEFAULT_TZ_NAME) or DEFAULT_TZ_NAME).strip()
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        tz_name = DEFAULT_TZ_NAME
+    try:
+        hour = int(get_setting("snapshot_hour", DEFAULT_SNAPSHOT_HOUR))
+    except (TypeError, ValueError):
+        hour = DEFAULT_SNAPSHOT_HOUR
+    try:
+        minute = int(get_setting("snapshot_minute", DEFAULT_SNAPSHOT_MINUTE))
+    except (TypeError, ValueError):
+        minute = DEFAULT_SNAPSHOT_MINUTE
+    hour = min(23, max(0, hour))
+    minute = min(59, max(0, minute))
+    return {
+        "enabled": _setting_bool("snapshot_enabled", DEFAULT_SNAPSHOT_ENABLED),
+        "timezone": tz_name,
+        "hour": hour,
+        "minute": minute,
+        "time": f"{hour:02d}:{minute:02d}",
+    }
+
+
+def email_rewrite_config():
+    source = get_setting("email_domain_rewrite_from", DEFAULT_EMAIL_DOMAIN_REWRITE_FROM)
+    target = get_setting("email_domain_rewrite_to", DEFAULT_EMAIL_DOMAIN_REWRITE_TO)
+    return {
+        "from": str(source or "").strip().lower().lstrip("@"),
+        "to": str(target or "").strip().lower().lstrip("@"),
+    }
+
+
+def _valid_domain(value):
+    value = str(value or "").strip().lower().lstrip("@")
+    if not value:
+        return True
+    return " " not in value and "@" not in value and "." in value and not value.startswith(".") and not value.endswith(".")
+
+
+def render_settings(message=None, error=None, data_result=None):
+    return render_template(
+        "settings.html", org=current_org(), cfg=github_connection(include_token=False),
+        email_cfg=email_rewrite_config(), snapshot_cfg=snapshot_config(),
+        message=message, error=error, data_result=data_result,
+        recent_snapshots=list_snapshots(8),
+    )
+
+
+def _extract_uploaded_database(upload):
+    """Return a validated temporary SQLite path from .db or tar/tar.gz without unsafe extraction."""
+    if not upload or not upload.filename:
+        raise ValueError("Wybierz plik bazy lub backup .tar.gz.")
+    workdir = tempfile.mkdtemp(prefix="gham-import-")
+    upload_path = Path(workdir) / "upload.bin"
+    upload.save(upload_path)
+    if upload_path.stat().st_size == 0:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise ValueError("Przesłany plik jest pusty.")
+    with open(upload_path, "rb") as fh:
+        if fh.read(16) == b"SQLite format 3\x00":
+            return workdir, str(upload_path)
+    try:
+        with tarfile.open(upload_path, "r:*") as tf:
+            candidates = [m for m in tf.getmembers() if m.isfile() and Path(m.name).name == "github-audit.db"]
+            if not candidates:
+                raise ValueError("Backup nie zawiera pliku github-audit.db.")
+            member = candidates[0]
+            if member.size > 240 * 1024 * 1024:
+                raise ValueError("Baza w archiwum jest zbyt duża.")
+            source = tf.extractfile(member)
+            if source is None:
+                raise ValueError("Nie udało się odczytać bazy z archiwum.")
+            db_path = Path(workdir) / "github-audit.db"
+            with open(db_path, "wb") as out:
+                shutil.copyfileobj(source, out, length=1024 * 1024)
+            return workdir, str(db_path)
+    except tarfile.TarError as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise ValueError("Obsługiwany jest plik github-audit.db albo backup .tar.gz z GitHub Audit Monitor.") from exc
 
 
 def current_org():
@@ -185,29 +281,39 @@ def progress(msg): run_state["progress"] = msg
 
 
 def execute_snapshot():
-    if not run_lock.acquire(blocking=False): return False
+    if not run_lock.acquire(blocking=False):
+        return False
     run_state.update({"running": True, "progress": "Starting...", "last_error": None})
     snapshot_id = None
     try:
-        connection = github_connection(include_token=True)
-        if not connection.get("configured"):
-            raise RuntimeError("Połączenie GitHub nie jest skonfigurowane. Ustaw organizację i token w Ustawieniach.")
-        org = connection["org"]
-        token = connection["token"]
-        snapshot_id = create_snapshot(org)
-        previous = latest_successful_snapshot(exclude_id=snapshot_id)
-        current, login = collect_snapshot(progress=progress, org=org, token=token)
-        changes = compare_snapshots(previous.get("data") if previous else None, current)
-        finish_snapshot(snapshot_id, current, changes, authenticated_user=login)
-        backup = backup_database()
-        run_state["progress"] = f"Completed. Changes: {len(changes)}. Backup: {backup}"
-        LOG.info(run_state["progress"]); return True
+        with database_operation_lock():
+            try:
+                connection = github_connection(include_token=True)
+                if not connection.get("configured"):
+                    raise RuntimeError("Połączenie GitHub nie jest skonfigurowane. Ustaw organizację i token w Ustawieniach.")
+                org = connection["org"]
+                token = connection["token"]
+                snapshot_id = create_snapshot(org)
+                previous = latest_successful_snapshot(exclude_id=snapshot_id)
+                current, login = collect_snapshot(progress=progress, org=org, token=token)
+                changes = compare_snapshots(previous.get("data") if previous else None, current)
+                finish_snapshot(snapshot_id, current, changes, authenticated_user=login)
+                backup = backup_database()
+                run_state["progress"] = f"Completed. Changes: {len(changes)}. Backup: {backup}"
+                LOG.info(run_state["progress"])
+                return True
+            except Exception as exc:
+                if snapshot_id is not None:
+                    fail_snapshot(snapshot_id, exc)
+                raise
     except Exception as exc:
-        LOG.exception("Snapshot failed"); run_state["last_error"] = str(exc); run_state["progress"] = f"FAILED: {exc}"
-        if snapshot_id is not None: fail_snapshot(snapshot_id, exc)
+        LOG.exception("Snapshot failed")
+        run_state["last_error"] = str(exc)
+        run_state["progress"] = f"FAILED: {exc}"
         return False
     finally:
-        run_state["running"] = False; run_lock.release()
+        run_state["running"] = False
+        run_lock.release()
 
 
 def start_snapshot_background():
@@ -216,20 +322,25 @@ def start_snapshot_background():
 
 
 def scheduler_loop():
-    tz = ZoneInfo(TZ_NAME)
+    last_slot = None
     while True:
-        now = datetime.now(tz); next_run = now.replace(hour=SNAPSHOT_HOUR, minute=SNAPSHOT_MINUTE, second=0, microsecond=0)
-        if next_run <= now: next_run += timedelta(days=1)
-        LOG.info("Next scheduled snapshot: %s", next_run.isoformat())
-        time.sleep(max(1, (next_run - now).total_seconds()))
+        cfg = snapshot_config()
         try:
-            if github_connection(include_token=False).get("configured"):
-                execute_snapshot()
-            else:
-                LOG.info("Scheduled snapshot skipped: GitHub connection is not configured")
-        except Exception:
-            LOG.exception("Scheduled snapshot preflight failed")
-        time.sleep(2)
+            now = datetime.now(ZoneInfo(cfg["timezone"]))
+        except (ZoneInfoNotFoundError, ValueError):
+            now = datetime.now(ZoneInfo(DEFAULT_TZ_NAME))
+        slot = f"{now.date().isoformat()}-{cfg['hour']:02d}:{cfg['minute']:02d}"
+        due = cfg["enabled"] and now.hour == cfg["hour"] and now.minute == cfg["minute"]
+        if due and slot != last_slot:
+            last_slot = slot
+            try:
+                if github_connection(include_token=False).get("configured"):
+                    execute_snapshot()
+                else:
+                    LOG.info("Scheduled snapshot skipped: GitHub connection is not configured")
+            except Exception:
+                LOG.exception("Scheduled snapshot preflight failed")
+        time.sleep(20)
 
 
 def latest_data():
@@ -246,13 +357,14 @@ def user_key(github_id=None, login=None):
 
 
 def normalize_email(value):
-    """Optionally rewrite one exact e-mail domain; leave every other domain untouched."""
+    """Optionally rewrite one exact e-mail domain for presentation/export; source data stays intact."""
     email = str(value or "").strip()
     if not email or "@" not in email:
         return email or None
     local, domain = email.rsplit("@", 1)
-    if EMAIL_DOMAIN_REWRITE_FROM and EMAIL_DOMAIN_REWRITE_TO and domain.lower() == EMAIL_DOMAIN_REWRITE_FROM:
-        return f"{local}@{EMAIL_DOMAIN_REWRITE_TO}"
+    cfg = email_rewrite_config()
+    if cfg["from"] and cfg["to"] and domain.lower() == cfg["from"]:
+        return f"{local}@{cfg['to']}"
     return email
 
 def user_status_label(u):
@@ -731,39 +843,121 @@ def logout():
     return resp
 
 
+@app.route("/settings")
+def settings_page():
+    return render_settings()
+
+
 @app.route("/settings/github", methods=["GET", "POST"])
 def github_settings():
-    message = None
-    error = None
-    cfg = github_connection(include_token=False)
-    if request.method == "POST":
-        action = (request.form.get("action") or "save").strip().lower()
+    if request.method == "GET":
+        return redirect(url_for("settings_page"))
+    action = (request.form.get("action") or "save").strip().lower()
+    try:
+        if action == "test_saved":
+            existing = github_connection(include_token=True)
+            if not existing.get("configured"):
+                raise ValueError("Połączenie GitHub nie jest jeszcze zapisane.")
+            result = test_connection(existing["org"], existing["token"])
+            set_setting("github_login", result.get("login") or "", updated_by=g.current_admin["username"])
+            set_setting("github_last_test_at", datetime.now(ZoneInfo("UTC")).isoformat(), updated_by=g.current_admin["username"])
+            return render_settings(message=f"Zapisane połączenie działa. GitHub: {result.get('login') or 'unknown'} · organizacja: {result.get('organization') or existing['org']}.")
+
         current_password = request.form.get("current_password") or ""
         reauth_ok, reauth_error = reauthenticate_current_admin(current_password)
         if not reauth_ok:
-            error = reauth_error
-        elif action == "remove":
+            return render_settings(error=reauth_error), 429 if "Zbyt wiele" in reauth_error else 400
+
+        if action == "remove":
             remove_github_connection(updated_by=g.current_admin["username"])
-            message = "Połączenie GitHub zostało usunięte."
-        else:
-            org = (request.form.get("github_org") or "").strip()
-            submitted_token = (request.form.get("github_token") or "").strip()
-            try:
-                existing = github_connection(include_token=True)
-                token = submitted_token or existing.get("token") or ""
-                if not token:
-                    raise ValueError("Wprowadź token GitHub.")
-                result = test_connection(org, token)
-                if action == "test":
-                    message = f"Połączenie działa. GitHub: {result.get('login') or 'unknown'} · organizacja: {result.get('organization') or org}."
-                else:
-                    save_github_connection(org, token, login=result.get("login"), updated_by=g.current_admin["username"])
-                    message = f"Połączenie GitHub zapisane i zweryfikowane jako {result.get('login') or 'unknown'}."
-            except Exception as exc:
-                LOG.warning("GitHub connection update failed: %s", exc)
-                error = str(exc)
-        cfg = github_connection(include_token=False)
-    return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error)
+            return render_settings(message="Połączenie GitHub zostało usunięte.")
+
+        org = (request.form.get("github_org") or "").strip()
+        submitted_token = (request.form.get("github_token") or "").strip()
+        existing = github_connection(include_token=True)
+        token = submitted_token or existing.get("token") or ""
+        if not token:
+            raise ValueError("Wprowadź token GitHub.")
+        result = test_connection(org, token)
+        save_github_connection(org, token, login=result.get("login"), updated_by=g.current_admin["username"])
+        return render_settings(message=f"Połączenie przetestowane i zapisane jako {result.get('login') or 'unknown'}.")
+    except Exception as exc:
+        LOG.warning("GitHub connection update failed: %s", exc)
+        return render_settings(error=str(exc)), 400
+
+
+@app.post("/settings/email")
+def email_settings_update():
+    source = (request.form.get("email_from") or "").strip().lower().lstrip("@")
+    target = (request.form.get("email_to") or "").strip().lower().lstrip("@")
+    if bool(source) != bool(target):
+        return render_settings(error="Aby włączyć normalizację, podaj obie domeny. Aby wyłączyć, wyczyść oba pola."), 400
+    if not _valid_domain(source) or not _valid_domain(target):
+        return render_settings(error="Nieprawidłowa domena e-mail."), 400
+    set_setting("email_domain_rewrite_from", source, updated_by=g.current_admin["username"])
+    set_setting("email_domain_rewrite_to", target, updated_by=g.current_admin["username"])
+    if source:
+        return render_settings(message=f"Normalizacja e-mail zapisana: @{source} → @{target}. Dane źródłowe w bazie nie są przepisywane.")
+    return render_settings(message="Normalizacja domeny e-mail została wyłączona.")
+
+
+@app.post("/settings/snapshots")
+def snapshot_settings_update():
+    enabled = request.form.get("snapshot_enabled") == "1"
+    time_value = (request.form.get("snapshot_time") or "03:00").strip()
+    timezone_name = (request.form.get("snapshot_timezone") or DEFAULT_TZ_NAME).strip()
+    try:
+        hour_text, minute_text = time_value.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        return render_settings(error="Nieprawidłowa godzina snapshotu."), 400
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return render_settings(error="Nieprawidłowa strefa czasowa, np. Europe/Warsaw."), 400
+    actor = g.current_admin["username"]
+    set_setting("snapshot_enabled", "true" if enabled else "false", updated_by=actor)
+    set_setting("snapshot_hour", str(hour), updated_by=actor)
+    set_setting("snapshot_minute", str(minute), updated_by=actor)
+    set_setting("snapshot_timezone", timezone_name, updated_by=actor)
+    return render_settings(message="Harmonogram snapshotów został zapisany. Zmiana działa bez restartu usługi.")
+
+
+@app.post("/settings/data/export")
+def data_export():
+    path = create_portable_backup()
+    return send_file(path, as_attachment=True, download_name=Path(path).name, mimetype="application/gzip", max_age=0)
+
+
+@app.post("/settings/data/import")
+def data_import():
+    current_password = request.form.get("current_password") or ""
+    reauth_ok, reauth_error = reauthenticate_current_admin(current_password)
+    if not reauth_ok:
+        return render_settings(error=reauth_error), 429 if "Zbyt wiele" in reauth_error else 400
+    if request.form.get("confirm_replace") != "1":
+        return render_settings(error="Potwierdź zastąpienie aktualnych danych."), 400
+    upload = request.files.get("database_file")
+    workdir = None
+    try:
+        workdir, db_path = _extract_uploaded_database(upload)
+        result = restore_database_from_path(db_path)
+        counts = result["live"]["counts"]
+        summary = (
+            f"Import zakończony. Snapshoty: {counts.get('snapshots', 0)}, "
+            f"Audit Log: {counts.get('audit_events', 0)}, ręczne korekty: {counts.get('user_overrides', 0)}."
+        )
+        if result.get("safety_backup"):
+            summary += f" Automatyczna kopia poprzedniej bazy: {Path(result['safety_backup']).name}."
+        return render_settings(message=summary, data_result=result)
+    except Exception as exc:
+        LOG.warning("Business database import failed: %s", exc, exc_info=True)
+        return render_settings(error=f"Import bazy nie powiódł się: {exc}"), 400
+    finally:
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 @app.post("/settings/account/password")
@@ -779,8 +973,7 @@ def account_password_change():
         reauth_ok, reauth_error = reauthenticate_current_admin(current_password)
         if not reauth_ok:
             error = reauth_error
-            cfg = github_connection(include_token=False)
-            return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error), 429 if "Zbyt wiele" in error else 400
+            return render_settings(message=message, error=error), 429 if "Zbyt wiele" in error else 400
         try:
             change_admin_password(g.current_admin["id"], current_password, new_password)
             message = "Hasło zostało zmienione. Zaloguj się ponownie."
@@ -789,8 +982,7 @@ def account_password_change():
             return resp
         except Exception as exc:
             error = str(exc)
-    cfg = github_connection(include_token=False)
-    return render_template("settings.html", org=current_org(), cfg=cfg, message=message, error=error), 400
+    return render_settings(message=message, error=error), 400
 
 
 @app.route("/health")
@@ -806,7 +998,9 @@ def index():
     repo_collabs=[u for u in all_users if u.get("is_repo_collaborator") and not u.get("hidden")]
     historical=[u for u in all_users if not u.get("current") and not u.get("hidden")]
     hidden=[u for u in all_users if u.get("hidden")]
-    return render_template("index.html",org=current_org(),latest=latest,snapshot=snapshot,users=active[:20],total_users=len(active),outside_count=len(outside),repo_collab_count=len(repo_collabs),historical_count=len(historical),hidden_count=len(hidden),changes=decorate_changes(list_changes(12), all_users),run_state=run_state,tz=TZ_NAME,schedule=f"{SNAPSHOT_HOUR:02d}:{SNAPSHOT_MINUTE:02d}")
+    sched=snapshot_config()
+    schedule=(f"{sched['time']} ({sched['timezone']})" if sched["enabled"] else "wyłączone")
+    return render_template("index.html",org=current_org(),latest=latest,snapshot=snapshot,users=active[:20],total_users=len(active),outside_count=len(outside),repo_collab_count=len(repo_collabs),historical_count=len(historical),hidden_count=len(hidden),changes=decorate_changes(list_changes(12), all_users),run_state=run_state,tz=sched["timezone"],schedule=schedule)
 
 @app.route("/users")
 def users_page():
@@ -837,7 +1031,7 @@ def user_edit(key):
     if user is None: return "User not found",404
     if request.method=="POST":
         save_user_override(key, github_id=request.form.get("github_id") or None, username=request.form.get("username") or None,
-            email=normalize_email(request.form.get("email")), joined_at=request.form.get("joined_at") or None, invited_at=request.form.get("invited_at") or None,
+            email=((request.form.get("email") or "").strip() or None), joined_at=request.form.get("joined_at") or None, invited_at=request.form.get("invited_at") or None,
             invited_by=request.form.get("invited_by") or None, display_name=request.form.get("display_name") or None, notes=request.form.get("notes") or None,
             hidden=request.form.get("hidden")=="1")
         backup_database(); return redirect(url_for("user_detail",key=key))
@@ -869,7 +1063,7 @@ def user_add():
         gid=(request.form.get("github_id") or "").strip(); username=(request.form.get("username") or "").strip()
         if not gid and not username: return "GitHub ID lub username jest wymagany",400
         key=user_key(gid or None,username or None)
-        save_user_override(key, github_id=gid or None, username=username or None, email=normalize_email(request.form.get("email")),
+        save_user_override(key, github_id=gid or None, username=username or None, email=((request.form.get("email") or "").strip() or None),
             joined_at=request.form.get("joined_at") or None, invited_at=request.form.get("invited_at") or None, invited_by=request.form.get("invited_by") or None,
             display_name=request.form.get("display_name") or None, notes=request.form.get("notes") or None, hidden=False)
         backup_database(); return redirect(url_for("user_detail",key=key))
@@ -907,8 +1101,8 @@ def statistics_page():
 
 @app.route("/changes")
 def changes_page():
-    users=build_users(latest_data(), include_hidden=True)
-    return render_template("changes.html",org=current_org(),changes=decorate_changes(list_changes(500),users),run_state=run_state)
+    # Backward-compatible URL: snapshot changes now live inside the combined history view.
+    return redirect(url_for("history_page", source="snapshot"), code=302)
 
 @app.route("/history")
 def history_page():
