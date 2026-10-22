@@ -23,7 +23,7 @@ The old GitHub Audit Mapper importer is no longer exposed in the UI. Existing da
 
 See also [`SECURITY.md`](SECURITY.md) for the deployment threat model and secret-handling details.
 
-The panel is not anonymous. On a fresh installation the Proxmox installer generates a random one-time **Setup Code**. The first browser session must use that code to create the local administrator account before any application data can be viewed.
+The panel is not anonymous. On a fresh installation the Proxmox installer generates a random one-time **Setup Code**. The first browser session must use that code to create the local administrator account before any application data can be viewed. Keeping this as a separate first-run secret prevents another client on the LAN from claiming the initial administrator account before the owner finishes setup.
 
 Security controls include:
 
@@ -93,7 +93,7 @@ Create the local administrator account, then open **Settings**. Configure the Gi
 If the Setup Code is lost before the first administrator account is created:
 
 ```bash
-pct exec CTID -- gham-security setup-code
+pct exec CTID -- /usr/local/bin/gham-security setup-code
 ```
 
 The application is installed natively in the LXC using Python venv + Gunicorn + systemd. Docker inside LXC is not required.

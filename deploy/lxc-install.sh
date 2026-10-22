@@ -5,8 +5,12 @@ SOURCE_DIR="${1:-/tmp/gham}"
 [[ -f /tmp/gham-config.env ]] || { echo "Missing /tmp/gham-config.env" >&2; exit 1; }
 
 export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+unset LANGUAGE || true
+umask 022
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends python3 python3-venv python3-pip sqlite3 curl ca-certificates tzdata >/dev/null
+apt-get install -y -qq --no-install-recommends python3 python3-venv python3-pip sqlite3 curl ca-certificates tzdata iproute2 >/dev/null
 
 if ! id ghamaudit >/dev/null 2>&1; then
   useradd --system --user-group --home /opt/github-audit-monitor --shell /usr/sbin/nologin ghamaudit
@@ -28,6 +32,9 @@ if [[ ! -x /opt/github-audit-monitor/.venv/bin/python ]]; then
 fi
 /opt/github-audit-monitor/.venv/bin/pip install --quiet --upgrade pip
 /opt/github-audit-monitor/.venv/bin/pip install --quiet --upgrade -r /opt/github-audit-monitor/app/requirements.txt
+# Runtime user must be able to traverse/execute the root-owned virtualenv.
+chown -R root:root /opt/github-audit-monitor/.venv
+chmod -R a+rX /opt/github-audit-monitor/.venv
 
 install -o root -g ghamaudit -m 0640 /tmp/gham-config.env /etc/github-audit-monitor/config.env
 rm -f /tmp/gham-config.env
@@ -40,6 +47,7 @@ if [[ ! -f "$MASTER_KEY" ]]; then
 fi
 chown root:ghamaudit "$MASTER_KEY"
 chmod 0640 "$MASTER_KEY"
+umask 022
 
 cp "$SOURCE_DIR/systemd/github-audit-monitor-web.service" /etc/systemd/system/
 cp "$SOURCE_DIR/systemd/github-audit-monitor-scheduler.service" /etc/systemd/system/
