@@ -1,8 +1,65 @@
-{% extends "base.html" %}{% block title %}Dashboard · GitHub Audit Monitor{% endblock %}{% block head %}<script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>{% endblock %}{% block content %}
-<div class="row"><div><h1 style="margin-bottom:4px">Dashboard</h1><div class="muted">Aktualny stan dostępów z GitHub REST API + lokalna historia Audit Log i ręczne uzupełnienia.</div></div><form method="post" action="/run-snapshot" class="right"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button id="run-snapshot-button" data-github-configured="{{ '1' if github_configured else '0' }}" class="btn" {% if run_state.running or not github_configured %}disabled{% endif %}>Uruchom snapshot teraz</button></form></div>
-{% if not github_configured %}<div class="notice warnbox section"><b>Połączenie GitHub nie jest skonfigurowane.</b> <a href="{{ url_for('github_settings') }}">Przejdź do Ustawień</a>, aby podać organizację i token przed pierwszym snapshotem.</div>{% endif %}
+{% extends "base.html" %}
+{% block title %}Dashboard · GitHub Audit Monitor{% endblock %}
+{% block head %}<script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>{% endblock %}
+{% macro delta_badge(delta) -%}
+  {% if delta %}<span class="delta {{ delta.tone }}" title="Zmiana względem poprzedniego poprawnego snapshotu">{{ delta.label }}</span>{% endif %}
+{%- endmacro %}
+{% block content %}
+<div class="row">
+  <div><h1 style="margin-bottom:4px">Dashboard</h1><div class="muted">Aktualny stan dostępów z GitHub REST API + lokalna historia Audit Log i ręczne uzupełnienia.</div></div>
+  <form method="post" action="/run-snapshot" class="right"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button id="run-snapshot-button" data-github-configured="{{ '1' if github_configured else '0' }}" class="btn" {% if run_state.running or not github_configured %}disabled{% endif %}>Uruchom snapshot teraz</button></form>
+</div>
+
+<div class="health-strip" aria-label="Stan monitora">
+  <span class="health-item {{ 'good' if github_configured else 'bad' }}"><i class="health-dot"></i>GitHub: <b>{{ 'połączony' if github_configured else 'brak konfiguracji' }}</b></span>
+  <span class="health-item {{ 'good' if latest else 'warn' }}"><i class="health-dot"></i>Snapshot: <b>{{ 'OK' if latest else 'brak' }}</b></span>
+  <span class="health-item {{ audit_freshness.level }}"><i class="health-dot"></i>Audit Log: <b>{{ audit_freshness.status_label }}</b></span>
+  <span class="health-item {{ 'good' if snapshot_cfg.enabled else 'warn' }}"><i class="health-dot"></i>Scheduler: <b>{{ schedule }}</b></span>
+</div>
+
+{% if not github_configured %}<div class="notice warnbox section"><b>Połączenie GitHub nie jest skonfigurowane.</b> <a href="{{ url_for('settings_page') }}">Przejdź do Ustawień</a>, aby podać organizację i token przed pierwszym snapshotem.</div>{% endif %}
 <div id="snapshot-status" class="status section" data-running="{{ '1' if run_state.running else '0' }}" data-status-url="{{ url_for('api_dashboard_status') }}" aria-live="polite"><b>Status:</b> <span id="snapshot-status-state" class="{% if run_state.running %}warn{% else %}good{% endif %}">{% if run_state.running %}snapshot w toku{% else %}idle{% endif %}</span> · <span id="snapshot-status-progress">{{ run_state.progress }}</span><div id="snapshot-status-error" class="bad" {% if not run_state.last_error %}hidden{% endif %}>{{ run_state.last_error or '' }}</div></div>
-{% if latest %}<div class="grid section"><div class="card kpi"><span class="muted">Członkowie org</span><b>{{ total_users }}</b></div><div class="card kpi"><span class="muted">Outside collaborators</span><b>{{ outside_count }}</b></div>{% if repo_collab_count %}<div class="card kpi"><span class="muted">Repo collaborators / fallback</span><b>{{ repo_collab_count }}</b></div>{% endif %}<div class="card kpi"><span class="muted">Historyczne</span><b>{{ historical_count }}</b></div><div class="card kpi"><span class="muted">Teamy</span><b>{{ latest.team_count }}</b></div><div class="card kpi"><span class="muted">Repozytoria</span><b>{{ latest.repo_count }}</b></div><div class="card kpi"><span class="muted">Ostrzeżenia</span><b class="{% if latest.warning_count %}warn{% endif %}">{{ latest.warning_count }}</b></div></div>
+
+{% if latest %}
+<div class="grid section">
+  <div class="card kpi"><span class="muted">Członkowie org</span><div class="kpi-line"><b>{{ member_count }}</b>{{ delta_badge(kpi_deltas.members) }}</div></div>
+  <div class="card kpi"><span class="muted">Outside collaborators</span><div class="kpi-line"><b>{{ outside_count }}</b>{{ delta_badge(kpi_deltas.outside) }}</div></div>
+  <div class="card kpi"><span class="muted">Historyczne</span><div class="kpi-line"><b>{{ historical_count }}</b></div></div>
+  <div class="card kpi"><span class="muted">Teamy</span><div class="kpi-line"><b>{{ latest.team_count }}</b>{{ delta_badge(kpi_deltas.teams) }}</div></div>
+  <div class="card kpi"><span class="muted">Repozytoria</span><div class="kpi-line"><b>{{ latest.repo_count }}</b>{{ delta_badge(kpi_deltas.repos) }}</div></div>
+  <div class="card kpi"><span class="muted">Ostrzeżenia</span><div class="kpi-line"><b class="{% if latest.warning_count %}warn{% endif %}">{{ latest.warning_count }}</b>{{ delta_badge(kpi_deltas.warnings) }}</div></div>
+</div>
+{% if repo_collab_count %}<div class="small muted" style="margin-top:8px">Repo collaborators / fallback: {{ repo_collab_count }}</div>{% endif %}
+
+<div class="dashboard-panels section">
+  <section class="card soft-card">
+    <div class="section-heading"><div><div class="small muted">Szybki audyt</div><h2>Uprzywilejowane dostępy</h2></div><a href="{{ url_for('access_page',tab='privileged') }}">Otwórz →</a></div>
+    <div class="metric-line">
+      <span class="metric-chip"><span class="muted small">Użytkownicy</span><br><b>{{ privileged_summary.users }}</b></span>
+      <span class="metric-chip"><span class="muted small">Admin</span><br><b class="perm-admin">{{ privileged_summary.admin }}</b></span>
+      <span class="metric-chip"><span class="muted small">Maintain</span><br><b class="perm-maintain">{{ privileged_summary.maintain }}</b></span>
+      <span class="metric-chip"><span class="muted small">Direct Write+</span><br><b>{{ privileged_summary.direct }}</b></span>
+      <span class="metric-chip"><span class="muted small">Outside Write+</span><br><b>{{ privileged_summary.outside }}</b></span>
+    </div>
+    <p class="small muted">Widok skupia Admin/Maintain oraz podwyższone dostępy Direct/Outside. To szybki punkt startowy do przeglądu uprawnień.</p>
+  </section>
+
+  <section class="card soft-card">
+    <div class="section-heading"><div><div class="small muted">Top 5</div><h2>Repozytoria</h2></div><a href="{{ url_for('access_page',tab='repositories') }}">Dostępy →</a></div>
+    <div class="compact-list">
+      {% for r in top_repositories %}<div class="compact-row"><span><a href="{{ url_for('access_page',tab='repositories',repo=r.repo) }}"><code>{{ r.repo }}</code></a><br><span class="small muted">Direct: {{ r.direct_count }} · uprzywilejowani: {{ r.privileged_count }}</span></span><b>{{ r.user_count }}</b></div>{% else %}<div class="muted">Brak przypisanych dostępów.</div>{% endfor %}
+    </div>
+    <div class="small muted" style="margin-top:10px">Ranking wg liczby użytkowników z przypisanym dostępem team/direct (bez samego organization default).</div>
+  </section>
+
+  <section class="card soft-card">
+    <div class="section-heading"><div><div class="small muted">Top 5</div><h2>Teamy</h2></div><a href="{{ url_for('access_page',tab='teams') }}">Wszystkie →</a></div>
+    <div class="compact-list">
+      {% for t in top_teams %}<div class="compact-row"><span><a href="{{ url_for('access_page',tab='teams',team=t.slug) }}"><b>{{ t.name }}</b></a><br><span class="small muted">Repo: {{ t.repo_count }} · max {{ t.highest_permission }}</span></span><b>{{ t.member_count }}</b></div>{% else %}<div class="muted">Brak teamów.</div>{% endfor %}
+    </div>
+  </section>
+</div>
+
 <div class="card section">
   <div><b>Ostatni poprawny snapshot:</b> {{ latest.finished_at }} UTC · token jako <code>{{ latest.authenticated_user }}</code></div>
   <div class="audit-freshness-row">
@@ -12,13 +69,14 @@
       <span class="pill freshness {{ audit_freshness.level }}">{{ audit_freshness.status_label }} · {{ audit_freshness.age_label }}</span>
       {% if audit_freshness.filename %}<span class="small muted">{{ audit_freshness.filename }}</span>{% endif %}
     {% else %}
-      <span class="bad">brak</span>
-      <span class="pill freshness bad">{{ audit_freshness.status_label }}</span>
-      <a class="small" href="{{ url_for('audit_import_page') }}">Zaimportuj Audit Log</a>
+      <span class="bad">brak</span><span class="pill freshness bad">{{ audit_freshness.status_label }}</span><a class="small" href="{{ url_for('audit_import_page') }}">Zaimportuj Audit Log</a>
     {% endif %}
   </div>
   <div class="muted audit-freshness-hint">Audit Log: zielony do 7 dni, żółty po 7 do 14 dni, czerwony powyżej 14 dni.</div>
-  <div class="muted">Automatycznie codziennie o {{ schedule }} ({{ tz }}). Profile nieobecne w snapshotcie trafiają do widoku historycznego zamiast być kasowane.</div>
-</div>{% endif %}
+  <div class="muted">Automatycznie codziennie o {{ schedule }}. Profile nieobecne w snapshotcie trafiają do widoku historycznego zamiast być kasowane.</div>
+</div>
+{% endif %}
+
 <div class="section"><div class="row"><h2>Członkowie organizacji</h2><a href="{{ url_for('users_page',scope='active') }}" class="right">Pokaż członków ({{ total_users }})</a></div><table><thead><tr><th>GitHub</th><th>E-mail</th><th>GitHub ID</th><th>Teamy</th><th>Repo</th></tr></thead><tbody>{% for u in users %}<tr class="clickrow"><td><a href="{{ url_for('user_detail',key=u.user_key) }}"><b>{{ u.login or '—' }}</b></a></td><td>{{ u.email or '—' }}</td><td class="mono">{{ u.id or '—' }}</td><td>{{ u.team_count }}</td><td>{{ u.repo_count }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Brak danych.</td></tr>{% endfor %}</tbody></table></div>
-<div class="section"><div class="row"><h2>Ostatnie zmiany snapshotów</h2><a class="right" href="{{ url_for('changes_page') }}">Pokaż pełną historię</a></div><table><thead><tr><th>Czas</th><th>Użytkownik</th><th>Co się zmieniło</th><th>Typ</th></tr></thead><tbody>{% for c in changes %}<tr><td class="small">{{ c.detected_at }}</td><td>{% if c.user_key %}<a href="{{ url_for('user_detail',key=c.user_key) }}"><b>{{ c.user_login or c.user_key }}</b></a>{% else %}<span class="muted">—</span>{% endif %}</td><td>{{ c.summary }}</td><td><span class="pill">{{ c.change_type }}</span> <span class="small muted">{{ c.entity_type }}</span></td></tr>{% else %}<tr><td colspan="4" class="muted">Pierwszy snapshot jest stanem bazowym.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}
+<div class="section"><div class="row"><h2>Ostatnie zmiany snapshotów</h2><a class="right" href="{{ url_for('history_page',source='snapshot') }}">Pokaż pełną historię</a></div><table><thead><tr><th>Czas</th><th>Użytkownik</th><th>Co się zmieniło</th><th>Typ</th></tr></thead><tbody>{% for c in changes %}<tr><td class="small">{{ c.detected_at }}</td><td>{% if c.user_key %}<a href="{{ url_for('user_detail',key=c.user_key) }}"><b>{{ c.user_login or c.user_key }}</b></a>{% else %}<span class="muted">—</span>{% endif %}</td><td>{{ c.summary }}</td><td><span class="pill">{{ c.change_type }}</span> <span class="small muted">{{ c.entity_type }}</span></td></tr>{% else %}<tr><td colspan="4" class="muted">Pierwszy snapshot jest stanem bazowym.</td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}

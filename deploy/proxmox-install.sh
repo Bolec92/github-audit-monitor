@@ -52,7 +52,7 @@ TEMPLATE_STORAGE="$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 && $3==
 [[ -n "$ROOTFS_STORAGE" && -n "$TEMPLATE_STORAGE" ]] || die "Could not auto-detect Proxmox storage."
 
 MODE="$(whiptail --title "$APP_NAME" --menu "Installation mode" 15 72 4 "default" "Recommended settings" "advanced" "Choose LXC resources and network" 3>&1 1>&2 2>&3)" || exit 1
-CTID="$NEXTID"; HOSTNAME="github-audit"; CORES=2; MEMORY=4096; SWAP=2048; DISK=24; BRIDGE="vmbr0"; NETMODE="dhcp"; IP_CIDR=""; GATEWAY=""
+CTID="$NEXTID"; HOSTNAME="github-audit"; CORES=2; MEMORY=2048; SWAP=2048; DISK=24; BRIDGE="vmbr0"; NETMODE="dhcp"; IP_CIDR=""; GATEWAY=""
 if [[ "$MODE" == "advanced" ]]; then
   CTID="$(input "LXC CT ID" "$CTID")"
   HOSTNAME="$(input "Hostname" "$HOSTNAME")"

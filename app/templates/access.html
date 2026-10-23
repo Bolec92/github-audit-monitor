@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Dostępy · GitHub Audit Monitor{% endblock %}
+{% block content %}
+<div class="row"><div><h1 style="margin-bottom:4px">Dostępy</h1><div class="muted">Przegląd podwyższonych uprawnień, teamów oraz dostępu do repozytoriów z najnowszego snapshotu.</div></div></div>
+<div class="access-tabs section">
+  <a class="btn {% if tab=='privileged' %}primary{% endif %}" href="{{ url_for('access_page',tab='privileged') }}">Uprzywilejowane</a>
+  <a class="btn {% if tab=='teams' %}primary{% endif %}" href="{{ url_for('access_page',tab='teams') }}">Teamy</a>
+  <a class="btn {% if tab=='repositories' %}primary{% endif %}" href="{{ url_for('access_page',tab='repositories') }}">Repozytoria</a>
+</div>
+
+{% if tab == 'privileged' %}
+<div class="grid section">
+  <div class="card kpi"><span class="muted">Użytkownicy do przeglądu</span><div class="kpi-line"><b>{{ privileged_summary.users }}</b></div></div>
+  <div class="card kpi"><span class="muted">Efektywny Admin</span><div class="kpi-line"><b class="perm-admin">{{ privileged_summary.admin }}</b></div></div>
+  <div class="card kpi"><span class="muted">Efektywny Maintain</span><div class="kpi-line"><b class="perm-maintain">{{ privileged_summary.maintain }}</b></div></div>
+  <div class="card kpi"><span class="muted">Direct Write+</span><div class="kpi-line"><b>{{ privileged_summary.direct }}</b></div></div>
+  <div class="card kpi"><span class="muted">Outside Write+</span><div class="kpi-line"><b>{{ privileged_summary.outside }}</b></div></div>
+</div>
+<div class="notice section"><b>Co trafia do tego widoku?</b> Efektywny <span class="perm-admin">Admin</span>/<span class="perm-maintain">Maintain</span>, bezpośredni dostęp <b>Write lub wyższy</b> oraz outside collaborator z efektywnym <b>Write lub wyższym</b>. To widok audytowy, a nie automatyczna ocena ryzyka.</div>
+<div class="section"><table><thead><tr><th>Użytkownik</th><th>Typ</th><th>Najwyższe</th><th>Repo wymagające przeglądu</th><th>Teamy</th></tr></thead><tbody>
+{% for u in privileged %}<tr><td><a href="{{ url_for('user_detail',key=u.user_key) }}"><b>{{ u.login or '—' }}</b></a>{% if u.email %}<div class="small muted">{{ u.email }}</div>{% endif %}</td><td>{% if u.is_outside_collaborator %}<span class="pill state-outside">Outside</span>{% else %}<span class="pill state-current">Member</span>{% endif %}</td><td><span class="pill perm-{{ u.highest_permission }}">{{ u.highest_permission }}</span></td><td><div class="repo-tags">{% for r in u.privileged_repos %}<a class="repo-tag" href="{{ url_for('access_page',tab='repositories',repo=r.repo) }}"><code>{{ r.repo }}</code><span class="perm-{{ r.permission }}">{{ r.permission }}</span></a>{% endfor %}</div><div class="small muted">{{ u.privileged_repo_count }} repo · direct elevated: {{ u.direct_repo_count }}</div></td><td>{% for team in u.teams[:5] %}<a class="pill" href="{{ url_for('access_page',tab='teams',team=team) }}">{{ team }}</a>{% endfor %}{% if u.teams|length > 5 %}<span class="small muted">+{{ u.teams|length - 5 }}</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Brak dostępów spełniających kryteria przeglądu.</td></tr>{% endfor %}
+</tbody></table></div>
+
+{% elif tab == 'teams' %}
+<form method="get" class="row section"><input type="hidden" name="tab" value="teams"><input class="search" name="q" value="{{ q }}" placeholder="team, użytkownik, e-mail lub repo"><button class="btn">Szukaj</button>{% if q %}<a class="btn" href="{{ url_for('access_page',tab='teams') }}">Wyczyść</a>{% endif %}</form>
+<div class="team-layout section">
+  <div>
+    <table><thead><tr><th>Team</th><th>Członkowie</th><th>Repo</th><th>Max</th></tr></thead><tbody>
+    {% for t in teams %}<tr class="clickrow"><td><a href="{{ url_for('access_page',tab='teams',team=t.slug,q=q or None) }}"><b>{{ t.name }}</b></a><div class="small muted"><code>{{ t.slug }}</code>{% if t.parent %} · parent: {{ t.parent }}{% endif %}</div></td><td><b>{{ t.member_count }}</b></td><td>{{ t.repo_count }}</td><td><span class="pill perm-{{ t.highest_permission }}">{{ t.highest_permission }}</span></td></tr>{% else %}<tr><td colspan="4" class="muted">Brak pasujących teamów.</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+  <div class="team-selected">
+    {% if selected_team %}
+    <section class="card">
+      <div class="section-heading"><div><div class="small muted">Team</div><h2>{{ selected_team.name }}</h2></div><span class="pill">{{ selected_team.privacy }}</span></div>
+      <div class="metric-line"><span class="metric-chip"><span class="muted small">Członkowie</span><br><b>{{ selected_team.member_count }}</b></span><span class="metric-chip"><span class="muted small">Repo</span><br><b>{{ selected_team.repo_count }}</b></span><span class="metric-chip"><span class="muted small">Najwyższe</span><br><b class="perm-{{ selected_team.highest_permission }}">{{ selected_team.highest_permission }}</b></span></div>
+      {% if selected_team.parent %}<div class="small muted">Parent team: {{ selected_team.parent }}</div>{% endif %}
+      <h3 class="section">Członkowie</h3>
+      <table><thead><tr><th>Użytkownik</th><th>Inne teamy</th><th>Wszystkie repo</th></tr></thead><tbody>{% for m in selected_team.members %}<tr><td><a href="{{ url_for('user_detail',key=m.user_key) }}"><b>{{ m.login or '—' }}</b></a>{% if m.email %}<div class="small muted">{{ m.email }}</div>{% endif %}</td><td>{{ m.team_count }}</td><td>{{ m.repo_count }}</td></tr>{% else %}<tr><td colspan="3" class="muted">Brak członków.</td></tr>{% endfor %}</tbody></table>
+      <h3 class="section">Repozytoria teamu</h3>
+      <table><thead><tr><th>Repo</th><th>Uprawnienie</th></tr></thead><tbody>{% for r in selected_team.repositories %}<tr><td><a href="{{ url_for('access_page',tab='repositories',repo=r.repo) }}"><code>{{ r.repo }}</code></a></td><td><span class="pill perm-{{ r.permission }}">{{ r.permission }}</span></td></tr>{% else %}<tr><td colspan="2" class="muted">Brak przypisanych repozytoriów.</td></tr>{% endfor %}</tbody></table>
+      <div class="small muted section">Kliknij użytkownika, aby zobaczyć pełny profil, wszystkie jego teamy oraz pozostałe ścieżki dostępu do repozytoriów.</div>
+    </section>
+    {% else %}
+    <div class="card"><h2>Wybierz team</h2><p class="muted">Kliknij nazwę teamu po lewej, aby zobaczyć jego członków, repozytoria i poziomy dostępu.</p></div>
+    {% endif %}
+  </div>
+</div>
+
+{% else %}
+<form method="get" class="row section"><input type="hidden" name="tab" value="repositories"><input class="search" name="q" value="{{ q }}" placeholder="repozytorium, użytkownik, team lub uprawnienie"><button class="btn">Szukaj</button>{% if q %}<a class="btn" href="{{ url_for('access_page',tab='repositories') }}">Wyczyść</a>{% endif %}</form>
+<div class="team-layout section">
+  <div>
+    <table><thead><tr><th>Repozytorium</th><th>Przypisani</th><th>Wszyscy</th><th>Max</th></tr></thead><tbody>
+    {% for r in repositories %}<tr class="clickrow"><td><a href="{{ url_for('access_page',tab='repositories',repo=r.repo,q=q or None) }}"><b>{{ r.repo }}</b></a><div class="small muted">{{ r.visibility }}{% if r.archived %} · archived{% endif %} · teamy: {{ r.team_count }} · direct: {{ r.direct_count }}</div></td><td><b>{{ r.assigned_count }}</b></td><td>{{ r.user_count }}</td><td><span class="pill perm-{{ r.highest_permission }}">{{ r.highest_permission }}</span></td></tr>{% else %}<tr><td colspan="4" class="muted">Brak pasujących repozytoriów.</td></tr>{% endfor %}
+    </tbody></table>
+    <div class="small muted section">„Przypisani” = użytkownicy z dostępem przez team lub direct. „Wszyscy” uwzględnia również organization default, jeśli jest skonfigurowany.</div>
+  </div>
+  <div class="team-selected">
+    {% if selected_repo %}
+    <section class="card">
+      <div class="section-heading"><div><div class="small muted">Repozytorium</div><h2><code>{{ selected_repo.repo }}</code></h2></div><span class="pill">{{ selected_repo.visibility }}{% if selected_repo.archived %} · archived{% endif %}</span></div>
+      <div class="metric-line">
+        <span class="metric-chip"><span class="muted small">Przypisani team/direct</span><br><b>{{ selected_repo.assigned_count }}</b></span>
+        <span class="metric-chip"><span class="muted small">Wszyscy z dostępem</span><br><b>{{ selected_repo.user_count }}</b></span>
+        <span class="metric-chip"><span class="muted small">Direct</span><br><b>{{ selected_repo.direct_count }}</b></span>
+        <span class="metric-chip"><span class="muted small">Teamy</span><br><b>{{ selected_repo.team_count }}</b></span>
+        <span class="metric-chip"><span class="muted small">Najwyższe</span><br><b class="perm-{{ selected_repo.highest_permission }}">{{ selected_repo.highest_permission }}</b></span>
+      </div>
+
+      <div class="notice repo-highest section">
+        <b>Najwyższe efektywne uprawnienie: <span class="perm-{{ selected_repo.highest_permission }}">{{ selected_repo.highest_permission }}</span></b>
+        <div class="repo-tags" style="margin-top:7px">
+          {% for m in selected_repo.highest_members[:12] %}<a class="repo-tag" href="{{ url_for('user_detail',key=m.user_key) }}"><b>{{ m.login or m.email or '—' }}</b>{% if m.is_outside_collaborator %}<span class="state-outside">Outside</span>{% endif %}</a>{% else %}<span class="muted">Brak użytkowników.</span>{% endfor %}{% if selected_repo.highest_members|length > 12 %}<span class="small muted">+{{ selected_repo.highest_members|length - 12 }} kolejnych</span>{% endif %}
+        </div>
+      </div>
+
+      <h3 class="section">Użytkownicy i efektywne uprawnienia</h3>
+      <table><thead><tr><th>Użytkownik</th><th>Typ</th><th>Efektywne</th><th>Źródła dostępu</th></tr></thead><tbody>
+      {% for m in selected_repo.members %}<tr><td><a href="{{ url_for('user_detail',key=m.user_key) }}"><b>{{ m.login or '—' }}</b></a>{% if m.email %}<div class="small muted">{{ m.email }}</div>{% endif %}</td><td>{% if m.is_outside_collaborator %}<span class="pill state-outside">Outside</span>{% else %}<span class="pill state-current">Member</span>{% endif %}</td><td><span class="pill perm-{{ m.effective_permission }}"><b>{{ m.effective_permission }}</b></span></td><td><div class="repo-sources">{% for src in m.sources %}{% if src.type == 'team' %}<a class="pill" href="{{ url_for('access_page',tab='teams',team=src.team) }}">{{ src.label }}</a>{% else %}<span class="pill">{{ src.label }}</span>{% endif %}<span class="small perm-{{ src.permission }}">{{ src.permission }}</span>{% if not loop.last %}<br>{% endif %}{% endfor %}</div></td></tr>{% else %}<tr><td colspan="4" class="muted">Brak użytkowników z dostępem.</td></tr>{% endfor %}
+      </tbody></table>
+      <div class="small muted section">Efektywne uprawnienie to najwyższy poziom wynikający ze wszystkich widocznych ścieżek: team, direct oraz organization default. Kliknij użytkownika, aby przejść do pełnego profilu dostępu.</div>
+    </section>
+    {% else %}
+    <div class="card"><h2>Wybierz repozytorium</h2><p class="muted">Kliknij repozytorium po lewej, aby zobaczyć użytkowników, źródła ich dostępu oraz najwyższe efektywne uprawnienia.</p></div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}

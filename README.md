@@ -15,7 +15,9 @@ Self-hosted GitHub organization access monitor focused on the gaps that are awkw
 - SQLite portable data backups and restore archives,
 - one-line Proxmox VE LXC installer,
 - mandatory first-run administrator setup and authenticated panel,
-- GitHub PAT encrypted at rest and managed from the panel.
+- GitHub PAT encrypted at rest and managed from the panel,
+- access review views for privileged grants and team membership,
+- dashboard KPI deltas plus Top repositories/teams.
 
 The old GitHub Audit Mapper importer is no longer exposed in the UI. Existing databases that already contain migrated Mapper data remain compatible and continue to use those records.
 
@@ -68,7 +70,7 @@ Run the command **on the Proxmox VE host as root**.
 
 The wizard is intentionally infrastructure-only. It supports:
 
-- Default or Advanced LXC resources,
+- Default or Advanced LXC resources (Default: 2 vCPU, 2 GB RAM),
 - unprivileged Debian LXC,
 - storage and bridge selection,
 - DHCP or static IPv4 configuration.

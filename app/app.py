@@ -844,6 +844,240 @@ def find_user(key):
     return next((u for u in build_users(latest_data(), include_hidden=True) if u["user_key"]==key),None)
 
 
+def delta_info(current, previous, semantic=False):
+    """Small dashboard delta descriptor relative to the previous successful snapshot."""
+    if previous is None:
+        return None
+    try:
+        change = int(current or 0) - int(previous or 0)
+    except (TypeError, ValueError):
+        return None
+    if change == 0:
+        tone = "flat"
+    elif semantic:
+        tone = "bad" if change > 0 else "good"
+    else:
+        tone = "up" if change > 0 else "down"
+    return {"value": change, "label": f"{change:+d}" if change else "0", "tone": tone}
+
+
+def dashboard_kpi_deltas(latest, previous):
+    if not latest or not previous:
+        return {}
+    current_data = latest.get("data") or {}
+    previous_data = previous.get("data") or {}
+    return {
+        "members": delta_info(latest.get("member_count"), previous.get("member_count")),
+        "outside": delta_info(len(current_data.get("outsideCollaborators", [])), len(previous_data.get("outsideCollaborators", []))),
+        "teams": delta_info(latest.get("team_count"), previous.get("team_count")),
+        "repos": delta_info(latest.get("repo_count"), previous.get("repo_count")),
+        "warnings": delta_info(latest.get("warning_count"), previous.get("warning_count"), semantic=True),
+    }
+
+
+def build_team_rows(snapshot, users):
+    snapshot = snapshot or {"teams": [], "repositories": []}
+    visible_users = [u for u in users if not u.get("hidden")]
+    by_id = {str(u.get("id")): u for u in visible_users if u.get("id") not in (None, "")}
+    by_login = {norm(u.get("login")): u for u in visible_users if u.get("login")}
+
+    repos_by_team = {}
+    for repo in snapshot.get("repositories", []):
+        for grant in repo.get("teams", []):
+            slug = str(grant.get("slug") or grant.get("name") or "").strip()
+            if not slug:
+                continue
+            repos_by_team.setdefault(slug, []).append({
+                "repo": repo.get("full_name"),
+                "permission": str(grant.get("permission") or "unknown").lower(),
+            })
+
+    rows = []
+    for team in snapshot.get("teams", []):
+        slug = str(team.get("slug") or team.get("name") or "").strip()
+        members = []
+        for raw in team.get("members", []):
+            user = None
+            if raw.get("id") not in (None, ""):
+                user = by_id.get(str(raw.get("id")))
+            if user is None and raw.get("login"):
+                user = by_login.get(norm(raw.get("login")))
+            if user:
+                members.append({
+                    "user_key": user.get("user_key"), "login": user.get("login"), "email": user.get("email"),
+                    "repo_count": user.get("repo_count", 0), "team_count": user.get("team_count", 0),
+                    "is_outside_collaborator": user.get("is_outside_collaborator"),
+                })
+            else:
+                members.append({
+                    "user_key": user_key(raw.get("id"), raw.get("login")), "login": raw.get("login"), "email": None,
+                    "repo_count": 0, "team_count": 0, "is_outside_collaborator": False,
+                })
+        members.sort(key=lambda x: str(x.get("login") or "").lower())
+        repos = sorted(repos_by_team.get(slug, []), key=lambda x: str(x.get("repo") or "").lower())
+        highest = max((r.get("permission") for r in repos), key=permission_rank, default="none")
+        rows.append({
+            "slug": slug,
+            "name": team.get("name") or slug,
+            "privacy": team.get("privacy") or "unknown",
+            "parent": team.get("parent"),
+            "members": members,
+            "member_count": len(members),
+            "repositories": repos,
+            "repo_count": len(repos),
+            "highest_permission": highest,
+        })
+    rows.sort(key=lambda x: (-x["member_count"], -x["repo_count"], str(x["name"]).lower()))
+    return rows
+
+
+def build_repository_rows(snapshot, users):
+    """Repository-centric view of effective access in the latest snapshot.
+
+    The detail view includes organization-default access so the effective permission is
+    complete. `assigned_count` stays focused on explicit team/direct grants so rankings
+    remain useful when every organization member inherits a default permission.
+    """
+    snapshot = snapshot or {"repositories": []}
+    current_users = [u for u in users if u.get("current") and not u.get("hidden")]
+    repo_meta = {
+        str(r.get("full_name") or ""): r
+        for r in snapshot.get("repositories", [])
+        if r.get("full_name")
+    }
+    rows = []
+    for repo_name, repo in repo_meta.items():
+        members = []
+        assigned_count = 0
+        direct_count = 0
+        highest = "none"
+        for u in current_users:
+            repo_row = next((r for r in u.get("repo_rows", []) if r.get("repo") == repo_name), None)
+            if not repo_row:
+                continue
+            effective = str(repo_row.get("effective") or "unknown").lower()
+            grants = repo_row.get("grants", [])
+            explicit = any(g.get("source") != "organization" for g in grants)
+            has_direct = any(g.get("source") == "direct" for g in grants)
+            if explicit:
+                assigned_count += 1
+            if has_direct:
+                direct_count += 1
+            if permission_rank(effective) > permission_rank(highest):
+                highest = effective
+
+            sources = []
+            for grant in grants:
+                source = grant.get("source") or "unknown"
+                permission = str(grant.get("permission") or "unknown").lower()
+                if source == "team":
+                    team = grant.get("team") or "unknown"
+                    sources.append({"type": "team", "label": f"Team: {team}", "team": team, "permission": permission})
+                elif source == "direct":
+                    sources.append({"type": "direct", "label": "Direct", "team": None, "permission": permission})
+                elif source == "organization":
+                    sources.append({"type": "organization", "label": "Organization default", "team": None, "permission": permission})
+                else:
+                    sources.append({"type": source, "label": str(source), "team": None, "permission": permission})
+
+            members.append({
+                "user_key": u.get("user_key"), "login": u.get("login"), "email": u.get("email"),
+                "member_type": u.get("member_type"), "is_outside_collaborator": u.get("is_outside_collaborator"),
+                "effective_permission": effective, "sources": sources, "explicit": explicit,
+                "team_count": u.get("team_count", 0), "repo_count": u.get("repo_count", 0),
+            })
+
+        members.sort(key=lambda m: (-permission_rank(m.get("effective_permission")), str(m.get("login") or "").lower()))
+        highest_members = [m for m in members if m.get("effective_permission") == highest]
+        rows.append({
+            "repo": repo_name,
+            "private": bool(repo.get("private")),
+            "visibility": repo.get("visibility") or ("private" if repo.get("private") else "public"),
+            "archived": bool(repo.get("archived")),
+            "team_count": len(repo.get("teams", [])),
+            "direct_count": direct_count,
+            "assigned_count": assigned_count,
+            "user_count": len(members),
+            "highest_permission": highest,
+            "highest_members": highest_members,
+            "members": members,
+        })
+    rows.sort(key=lambda r: (-r["assigned_count"], -permission_rank(r["highest_permission"]), str(r["repo"]).lower()))
+    return rows
+
+
+def build_access_overview(snapshot, users):
+    current_users = [u for u in users if u.get("current") and not u.get("hidden")]
+    repo_stats = {}
+    privileged = []
+    summary_sets = {"users": set(), "admin": set(), "maintain": set(), "direct": set(), "outside": set()}
+
+    for u in current_users:
+        user_privileged_repos = []
+        user_direct_repos = []
+        highest = "none"
+        for repo_row in u.get("repo_rows", []):
+            repo_name = repo_row.get("repo")
+            grants = repo_row.get("grants", [])
+            non_org = [g for g in grants if g.get("source") != "organization"]
+            if non_org:
+                stat = repo_stats.setdefault(repo_name, {"repo": repo_name, "users": set(), "direct_users": set(), "privileged_users": set()})
+                stat["users"].add(u.get("user_key"))
+                if any(g.get("source") == "direct" for g in non_org):
+                    stat["direct_users"].add(u.get("user_key"))
+                if permission_rank(repo_row.get("effective")) >= permission_rank("maintain"):
+                    stat["privileged_users"].add(u.get("user_key"))
+
+            effective = str(repo_row.get("effective") or "unknown").lower()
+            if permission_rank(effective) > permission_rank(highest):
+                highest = effective
+            direct_high = [g for g in grants if g.get("source") == "direct" and permission_rank(g.get("permission")) >= permission_rank("write")]
+            effective_high = permission_rank(effective) >= permission_rank("maintain")
+            outside_high = bool(u.get("is_outside_collaborator")) and permission_rank(effective) >= permission_rank("write")
+
+            if effective_high or direct_high or outside_high:
+                reasons = []
+                if effective == "admin":
+                    reasons.append("Admin")
+                    summary_sets["admin"].add(u.get("user_key"))
+                elif effective == "maintain":
+                    reasons.append("Maintain")
+                    summary_sets["maintain"].add(u.get("user_key"))
+                if direct_high:
+                    reasons.append("Direct Write+")
+                    summary_sets["direct"].add(u.get("user_key"))
+                    user_direct_repos.append(repo_name)
+                if outside_high:
+                    reasons.append("Outside Write+")
+                    summary_sets["outside"].add(u.get("user_key"))
+                user_privileged_repos.append({"repo": repo_name, "permission": effective, "reasons": reasons})
+
+        if user_privileged_repos:
+            summary_sets["users"].add(u.get("user_key"))
+            privileged.append({
+                "user_key": u.get("user_key"), "login": u.get("login"), "email": u.get("email"),
+                "member_type": u.get("member_type"), "is_outside_collaborator": u.get("is_outside_collaborator"),
+                "highest_permission": highest, "teams": u.get("teams", []),
+                "repo_count": u.get("repo_count", 0), "privileged_repos": user_privileged_repos,
+                "privileged_repo_count": len(user_privileged_repos), "direct_repo_count": len(set(user_direct_repos)),
+            })
+
+    privileged.sort(key=lambda u: (-permission_rank(u.get("highest_permission")), -u.get("privileged_repo_count", 0), str(u.get("login") or "").lower()))
+    top_repositories = []
+    for stat in repo_stats.values():
+        top_repositories.append({
+            "repo": stat["repo"], "user_count": len(stat["users"]),
+            "direct_count": len(stat["direct_users"]), "privileged_count": len(stat["privileged_users"]),
+        })
+    top_repositories.sort(key=lambda r: (-r["user_count"], -r["direct_count"], str(r["repo"] or "").lower()))
+
+    return {
+        "privileged": privileged,
+        "summary": {k: len(v) for k, v in summary_sets.items()},
+        "top_repositories": top_repositories,
+    }
+
+
 def parse_json_upload(file):
     raw=file.read().decode("utf-8-sig").strip()
     if not raw: return []
@@ -1075,6 +1309,7 @@ def health():
 @app.route("/")
 def index():
     latest=latest_successful_snapshot(); snapshot=latest.get("data") if latest else None
+    previous=latest_successful_snapshot(exclude_id=latest.get("id")) if latest else None
     all_users=build_users(snapshot, include_hidden=True)
     active=[u for u in all_users if u.get("is_org_member") and not u.get("hidden")]
     outside=[u for u in all_users if u.get("is_outside_collaborator") and not u.get("hidden")]
@@ -1083,12 +1318,18 @@ def index():
     hidden=[u for u in all_users if u.get("hidden")]
     sched=snapshot_config()
     schedule=(f"{sched['time']} ({sched['timezone']})" if sched["enabled"] else "wyłączone")
+    audit_freshness=audit_import_freshness()
+    access=build_access_overview(snapshot, all_users)
+    team_rows=build_team_rows(snapshot, all_users)
     return render_template(
         "index.html", org=current_org(), latest=latest, snapshot=snapshot, users=active[:20],
+        member_count=(latest.get("member_count") if latest else len(active)),
         total_users=len(active), outside_count=len(outside), repo_collab_count=len(repo_collabs),
         historical_count=len(historical), hidden_count=len(hidden),
         changes=decorate_changes(list_changes(12), all_users), run_state=dashboard_run_status(),
-        audit_freshness=audit_import_freshness(), tz=sched["timezone"], schedule=schedule,
+        audit_freshness=audit_freshness, tz=sched["timezone"], schedule=schedule, snapshot_cfg=sched,
+        kpi_deltas=dashboard_kpi_deltas(latest, previous), privileged_summary=access["summary"],
+        top_repositories=access["top_repositories"][:5], top_teams=team_rows[:5],
     )
 
 @app.route("/users")
@@ -1157,6 +1398,41 @@ def user_add():
             display_name=request.form.get("display_name") or None, notes=request.form.get("notes") or None, hidden=False)
         backup_database(); return redirect(url_for("user_detail",key=key))
     return render_template("user_edit.html",org=current_org(),user=None)
+
+@app.route("/access")
+def access_page():
+    snapshot=latest_data() or {"teams": [], "repositories": []}
+    users=build_users(snapshot, include_hidden=True)
+    tab=(request.args.get("tab") or "privileged").strip().lower()
+    if tab not in {"privileged", "teams", "repositories"}: tab="privileged"
+    access=build_access_overview(snapshot, users)
+    team_rows=build_team_rows(snapshot, users)
+    repository_rows=build_repository_rows(snapshot, users)
+    q=(request.args.get("q") or "").strip()
+    filtered_teams=team_rows
+    filtered_repositories=repository_rows
+    if q:
+        qn=q.lower()
+        filtered_teams=[t for t in team_rows if qn in " ".join([
+            str(t.get("name") or ""), str(t.get("slug") or ""), str(t.get("parent") or ""),
+            " ".join(str(r.get("repo") or "") for r in t.get("repositories", [])),
+            " ".join(str(m.get("login") or "") + " " + str(m.get("email") or "") for m in t.get("members", [])),
+        ]).lower()]
+        filtered_repositories=[r for r in repository_rows if qn in " ".join([
+            str(r.get("repo") or ""), str(r.get("visibility") or ""), str(r.get("highest_permission") or ""),
+            " ".join(str(m.get("login") or "") + " " + str(m.get("email") or "") for m in r.get("members", [])),
+            " ".join(str(src.get("team") or "") for m in r.get("members", []) for src in m.get("sources", [])),
+        ]).lower()]
+    selected_slug=(request.args.get("team") or "").strip()
+    selected_team=next((t for t in team_rows if t.get("slug") == selected_slug), None)
+    selected_repo_name=(request.args.get("repo") or "").strip()
+    selected_repo=next((r for r in repository_rows if r.get("repo") == selected_repo_name), None)
+    return render_template(
+        "access.html", org=current_org(), tab=tab, privileged=access["privileged"],
+        privileged_summary=access["summary"], teams=filtered_teams, repositories=filtered_repositories, q=q,
+        selected_team=selected_team, selected_repo=selected_repo,
+    )
+
 
 @app.route("/audit",methods=["GET","POST"])
 def audit_import_page():
